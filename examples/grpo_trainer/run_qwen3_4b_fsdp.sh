@@ -8,33 +8,34 @@ set -xeuo pipefail
 # ---- user-adjustable ----
 # DEVICE is auto-detected by probing torch_npu; override only for special cases.
 DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
-INFER_BACKEND=${INFER_BACKEND:-vllm}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen3-4B}
-TRAIN_FILE=${TRAIN_FILE:-$HOME/data/gsm8k/train.parquet}
-TEST_FILE=${TEST_FILE:-$HOME/data/gsm8k/test.parquet}
-NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+INFER_BACKEND=vllm
+MODEL_PATH="/data/wx_data/models/Qwen3-4B-Base"
+TRAIN_FILE="['/data/wx_data/datasets/DeepScaleR/deepscaler_train.parquet']"
+TEST_FILE="['/data/wx_data/datasets/DeepScaleR/aime.parquet','/data/wx_data/datasets/DeepScaleR/amc.parquet','/data/wx_data/datasets/DeepScaleR/math.parquet','/data/wx_data/datasets/DeepScaleR/minerva.parquet','/data/wx_data/datasets/DeepScaleR/olympiad_bench.parquet']"
+NNODES=1
+NGPUS_PER_NODE=4
 
-TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-512}
-PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-256}
-PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU:-2}
-LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-2}
-MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-1024}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-1024}
+TRAIN_BATCH_SIZE=512
+PPO_MINI_BATCH_SIZE=256
+PPO_MICRO_BATCH_SIZE_PER_GPU=2
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=2
+MAX_PROMPT_LENGTH=2048
+MAX_RESPONSE_LENGTH=4096
+MAX_TOKEN_LEN_PER_GPU=${MAX_TOKEN_LEN_PER_GPU:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}
 
-ACTOR_LR=${ACTOR_LR:-1e-6}
-KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
-ENTROPY_COEFF=${ENTROPY_COEFF:-0}
+ACTOR_LR=1e-6
+KL_LOSS_COEF=1e-5
+ENTROPY_COEFF=0.0
 
-ROLLOUT_TP=${ROLLOUT_TP:-2}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.6}
-ROLLOUT_N=${ROLLOUT_N:-5}
+ROLLOUT_TP=2
+ROLLOUT_GPU_MEM_UTIL=0.6
+ROLLOUT_N=8
 
-PROJECT_NAME=${PROJECT_NAME:-verl_grpo_example_geo3k}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-glm41v_9b_function_rm}
-SAVE_FREQ=${SAVE_FREQ:-20}
-TEST_FREQ=${TEST_FREQ:-5}
-TOTAL_EPOCHS=${TOTAL_EPOCHS:-15}
+PROJECT_NAME=length_scaling
+EXPERIMENT_NAME=0609-qwen3_4b_base-4k-1
+SAVE_FREQ=20
+TEST_FREQ=5
+TOTAL_EPOCHS=3
 
 # ---- end user-adjustable ----
 
@@ -59,8 +60,8 @@ esac
 
 DATA=(
     algorithm.adv_estimator=grpo
-    data.train_files=${TRAIN_FILE}
-    data.val_files=${TEST_FILE}
+    "data.train_files=${TRAIN_FILE}"
+    "data.val_files=${TEST_FILE}"
     data.train_batch_size=${TRAIN_BATCH_SIZE}
     data.max_prompt_length=${MAX_PROMPT_LENGTH}
     data.max_response_length=${MAX_RESPONSE_LENGTH}
@@ -85,7 +86,7 @@ ACTOR=(
     actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=3000
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.actor.use_dynamic_bsz=True
 )
 
@@ -98,7 +99,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.free_cache_engine=True
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
 )
@@ -107,7 +108,7 @@ REF=(
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}
     actor_rollout_ref.ref.fsdp_config.param_offload=True
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=8192
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${MAX_TOKEN_LEN_PER_GPU}
 )
 
 TRAINER=(

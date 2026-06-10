@@ -26,7 +26,13 @@ from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.cli.serve import run_headless
+try:
+    from vllm.entrypoints.cli.serve import run_headless
+except ImportError:
+    from vllm.entrypoints.cli.serve import run_server
+
+    def run_headless(args):
+        return asyncio.run(run_server(args))
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest

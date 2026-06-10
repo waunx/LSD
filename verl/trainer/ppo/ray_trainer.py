@@ -19,7 +19,9 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import hashlib
 import os
+import re
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -502,6 +504,233 @@ class RayPPOTrainer:
                 still_pending.append(f)
         self._dump_futures = still_pending
 
+    @staticmethod
+    def _length_scaling_pattern_counts(text: str) -> dict[str, int | float]:
+        """Count coarse reasoning patterns for length-scaling diagnostics."""
+        text = text or ""
+        lowered = text.lower()
+        pattern_groups = {
+            "calculation": [
+                "calculate",
+                "compute",
+                "simplify",
+                "solve",
+                "equation",
+                "substitute",
+                "therefore",
+                "thus",
+                "计算",
+                "代入",
+                "化简",
+                "求解",
+            ],
+            "verification": [
+                "check",
+                "verify",
+                "verification",
+                "confirm",
+                "double-check",
+                "ensure",
+                "validate",
+                "sanity check",
+                "检查",
+                "验证",
+                "确认",
+            ],
+            "definition": [
+                "definition",
+                "by definition",
+                "theorem",
+                "lemma",
+                "property",
+                "formula",
+                "recall",
+                "定义",
+                "定理",
+                "性质",
+                "公式",
+            ],
+            "self_talk": [
+                "let's",
+                "we need",
+                "i need",
+                "maybe",
+                "wait",
+                "hmm",
+                "i think",
+                "actually",
+                "我们需要",
+                "等等",
+                "也许",
+                "实际上",
+            ],
+            "padding": [
+                "again",
+                "as mentioned",
+                "in other words",
+                "note that",
+                "repeating",
+                "to be safe",
+                "再次",
+                "换句话说",
+                "注意",
+            ],
+        }
+        counts = {name: sum(lowered.count(pattern) for pattern in patterns) for name, patterns in pattern_groups.items()}
+        escaped_boxed = lowered.count(r"\boxed")
+        counts["boxed_answer"] = escaped_boxed + max(0, lowered.count("boxed{") - escaped_boxed)
+        counts["answer_marker"] = lowered.count("answer:") + lowered.count("final answer")
+        return counts
+
+    @staticmethod
+    def _repetition_stats(text: str, ngram_size: int = 20) -> dict[str, int | float]:
+        words = re.findall(r"\S+", (text or "").lower())
+        if len(words) < ngram_size:
+            return {"repetition_ratio_20gram": 0.0, "most_repeated_20gram": 0}
+
+        ngrams = list(zip(*[words[i:] for i in range(ngram_size)]))
+        seen = set()
+        repeated_count = 0
+        ngram_counts = defaultdict(int)
+        for ngram in ngrams:
+            ngram_counts[ngram] += 1
+            if ngram in seen:
+                repeated_count += 1
+            else:
+                seen.add(ngram)
+
+        return {
+            "repetition_ratio_20gram": repeated_count / len(ngrams),
+            "most_repeated_20gram": max(ngram_counts.values()) if ngram_counts else 0,
+        }
+
+    @classmethod
+    def _write_length_scaling_eval_records(
+        cls,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        response_lengths,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        dump_path,
+        global_steps,
+    ):
+        """Write one JSONL row per validation prompt with pass@k and length diagnostics."""
+        # 同一个 prompt 的多条采样 response 聚合成一行，并附带 reward、长度、重复度、模式统计等信息。
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+
+        grouped = {}
+        n = len(outputs)
+        for i in range(n):
+            prompt = str(inputs[i])
+            prompt_id = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:16]
+            uid = str(sample_uids[i])
+            key = (uid, prompt_id)
+            if key not in grouped:
+                grouped[key] = {
+                    "step": global_steps,
+                    "uid": uid,
+                    "prompt_id": prompt_id,
+                    "data_source": str(data_sources[i]),
+                    "prompt": prompt,
+                    "ground_truth": gts[i],
+                    "outputs": [],
+                }
+
+            output = str(outputs[i])
+            score = float(scores[i])
+            # 统计 response 里 有哪些推理/验证/定义/自言自语/填充/答案标记模式
+            # 将 response 转成小写，数关键词出现次数
+            counts = cls._length_scaling_pattern_counts(output) # ？
+            # 统计 response 20-gram 重复程度
+            # 统计回答是否出现长片段重复，主要检测输出变长时的复读现象
+            repetition = cls._repetition_stats(output) # ？
+            output_record = {
+                "rank": len(grouped[key]["outputs"]),
+                "output": output,
+                "score": score,
+                "response_length": float(response_lengths[i]),
+                "pattern_counts": counts,
+                **repetition,
+            }
+            for info_key, values in reward_extra_infos_dict.items():
+                if len(values) == n and info_key not in {"reward"}:
+                    output_record[info_key] = values[i]
+            grouped[key]["outputs"].append(output_record)
+
+        with open(filename, "w") as f:
+            for record in grouped.values():
+                outputs_for_prompt = record["outputs"]
+                output_scores = [item["score"] for item in outputs_for_prompt]
+                lengths = [item["response_length"] for item in outputs_for_prompt]
+                aggregate_counts = defaultdict(float)
+                for item in outputs_for_prompt:
+                    for name, value in item["pattern_counts"].items():
+                        aggregate_counts[name] += float(value)
+
+                n_outputs = len(outputs_for_prompt)
+                record.update(
+                    {
+                        "n": n_outputs,
+                        "pass@8": float(max(output_scores)) if output_scores else 0.0,
+                        "avg_reward@8": float(np.mean(output_scores)) if output_scores else 0.0,
+                        "avg_length@8": float(np.mean(lengths)) if lengths else 0.0,
+                        "min_length@8": float(np.min(lengths)) if lengths else 0.0,
+                        "max_length@8": float(np.max(lengths)) if lengths else 0.0,
+                        "scores@8": output_scores,
+                        "lengths@8": lengths,
+                        "pattern_counts_sum@8": dict(aggregate_counts),
+                        "pattern_counts_avg@8": {
+                            name: value / n_outputs for name, value in aggregate_counts.items()
+                        }
+                        if n_outputs
+                        else {},
+                    }
+                )
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+        print(f"Dumped length-scaling eval records to {filename}")
+
+    def _dump_length_scaling_eval_records(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        response_lengths,
+        data_sources,
+        sample_uids,
+        reward_extra_infos_dict,
+        dump_path,
+    ):
+        """Dump aggregated validation diagnostics asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._write_length_scaling_eval_records,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            response_lengths,
+            data_sources,
+            sample_uids,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
     def _init_dump_executor(self):
         """Create or recreate the dump executor and futures list."""
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
@@ -605,22 +834,25 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_gts = []
         sample_scores = []
+        sample_response_lengths = []
         sample_turns = []
         sample_uids = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
+            # ensure test_batch has "uid"
             if "uid" not in test_batch.non_tensor_batch:
                 test_batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # repeat test batch
+            # repeat test batch （保持llm模型随机性）
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
+            # ground_truths
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
@@ -628,8 +860,8 @@ class RayPPOTrainer:
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
+                "eos_token_id": self.tokenizer.eos_token_id, # end of sequence token id for generation stopping
+                "pad_token_id": self.tokenizer.pad_token_id, # pad token id for padding the batch to be divisible by dp size
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
@@ -638,10 +870,13 @@ class RayPPOTrainer:
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
+            # 批次对齐，让多个 rollout worker 平均分活
             size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            # generate_sequences
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
+            # compute reward if using colocate reward model
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
@@ -659,25 +894,29 @@ class RayPPOTrainer:
 
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids] # 解码 responses
+            sample_outputs.extend(output_texts) # sample_outputs 存储生成文本
+            response_mask = test_output_gen_batch.batch["attention_mask"][:, -output_ids.shape[-1] :] # 剃掉输入
+            sample_response_lengths.extend(response_mask.sum(-1).cpu().tolist()) # 统计 response 的有效 token 数
 
-            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch = test_batch.union(test_output_gen_batch) # 合并两个 DataProto
             test_batch.meta_info["validate"] = True
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
             # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids] # 解码 prompts
+            sample_inputs.extend(input_texts) # input prompts
+            sample_uids.extend(test_batch.non_tensor_batch["uid"]) # 1 prompt n responses 共享一个 uid
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)
 
+            # scores
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
+            # reward_extra_infos_dict
             reward_extra_infos_dict["reward"].extend(scores)
             for key, values in reward_extra_info.items():
                 if key not in reward_extra_infos_dict:
@@ -691,13 +930,16 @@ class RayPPOTrainer:
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
+            # data_sources （AIME、AMC、MATH、MINERVA、OLYMPIAD_BENCH）
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        data_sources = np.concatenate(data_source_lst, axis=0) # 拼接 data_sources
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores) # 抽样 swanlab
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            # 保存验证数据 prompt / response / ground truth / reward / reward_extra_infos_dict
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -705,6 +947,17 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+            )
+            self._dump_length_scaling_eval_records(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                gts=sample_gts,
+                scores=sample_scores,
+                response_lengths=sample_response_lengths,
+                data_sources=data_sources,
+                sample_uids=sample_uids,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=os.path.join(val_data_dir, "length_scaling_eval"),
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -718,27 +971,33 @@ class RayPPOTrainer:
                 "sample_turns": sample_turns,
                 "reward_extra_infos_dict": reward_extra_infos_dict,
             }
-        data_sources = np.concatenate(data_source_lst, axis=0)
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+
+        def add_validation_metrics(metric_data_sources):
+            data_src2var2metric2val = process_validation_metrics(
+                metric_data_sources, sample_uids, reward_extra_infos_dict
+            )
+            for data_source, var2metric2val in data_src2var2metric2val.items():
+                core_var = "acc" if "acc" in var2metric2val else "reward"
+                for var_name, metric2val in var2metric2val.items():
+                    n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                    for metric_name, metric_val in metric2val.items():
+                        if (
+                            (var_name == core_var)
+                            and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                            and (f"@{n_max}" in metric_name)
+                        ):
+                            metric_sec = "val-core"
+                        else:
+                            metric_sec = "val-aux"
+                        pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                        metric_dict[pfx] = metric_val
+
+        add_validation_metrics(data_sources)
+        add_validation_metrics(np.full_like(data_sources, "TOTAL", dtype=object))
 
         if len(sample_turns) > 0:
             sample_turns = np.concatenate(sample_turns)
@@ -1411,6 +1670,7 @@ class RayPPOTrainer:
 
         SkipManager.set_step(self.global_steps)
 
+        # profiler 记录用时
         prev_step_profile = False
         curr_step_profile = (
             self.global_steps in self.config.global_profiler.steps
@@ -1426,27 +1686,33 @@ class RayPPOTrainer:
                 metrics = {}
                 timing_raw = {}
 
+                # 是否启动 profiler
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
+                # 加载数据
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
+                # 一条 prompt 对应一个 uid
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
+                # 取出 gen 需要的数据
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                # 多次采样
                 rollout_n = self.config.actor_rollout_ref.rollout.n
                 gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
 
+                # REMAX：每个 prompt 生成一条 sampled response，再额外生成一条 greedy baseline response，用 baseline reward 做减法。
                 if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                     # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
                     # Keep them in a single agent-loop/vLLM request to avoid sending a second
@@ -1465,9 +1731,12 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        # profiler
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
+                        # 核心：generate_sequences
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        # sleep rollout model
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
@@ -1475,28 +1744,37 @@ class RayPPOTrainer:
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
 
+                    # 获取 response
                     gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                    # 删掉临时字段 __do_sample__
                     if "__do_sample__" in gen_batch_output.non_tensor_batch:
                         gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # 获取 greedy sample 下的 baseline reward
                         gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                        # pop __do_sample__
                         if "__do_sample__" in gen_baseline_output.non_tensor_batch:
                             gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
+                        # 如果启用 reward model 且 gen_baseline_output 中没有 rm_scores
+                        # 则用 reward model 给 baseline response 打分
                         if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
                             baseline_reward = self._compute_reward_colocate(gen_baseline_output)
                             gen_baseline_output = gen_baseline_output.union(baseline_reward)
 
                         reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+                        # 储存 baseline reward 删除 baseline response
                         batch.batch["reward_baselines"] = reward_baseline_tensor
 
                         del gen_baseline_output
                     del combined_gen_batch, combined_gen_output
+                    
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
+                    # compute response mask
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1507,7 +1785,10 @@ class RayPPOTrainer:
                         self._balance_batch(batch, metrics=metrics)
 
                     # compute global_valid tokens
+                    # 统计每条样本的有效 token 数 （prompt + response）
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
+                    
+                    # 图像相关（pass）
                     # get images_seqlens
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
@@ -1515,6 +1796,8 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    
+                    # 读取 reward 相关信息
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
@@ -1531,6 +1814,7 @@ class RayPPOTrainer:
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                        # 不重新算，直接用 rollout 时已经算好的 rollout_log_probs
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -1539,6 +1823,8 @@ class RayPPOTrainer:
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
                     else:  # Recompute old_log_probs
+                        # 让 actor model 再 forward 一遍当前 batch ，重新算一遍 old_log_probs
+                        # 优点：标准 稳定，缺点：要在跑一遍 forward
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]

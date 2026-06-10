@@ -35,7 +35,7 @@ def _get_pool():
     if _pool is None:
         with _pool_lock:
             if _pool is None:
-                _pool = ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("spawn"))
+                _pool = ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("fork"))
     return _pool
 
 
@@ -63,5 +63,8 @@ def compute_score(model_output: str, ground_truth: str, timeout_score: float = 0
     except (FuturesTimeoutError, TimeoutException):
         ret_score = timeout_score
     except Exception as e:
+        global _pool
+        with _pool_lock:
+            _pool = None
         print(f"Error in math_verify compute_score: {e}")
     return ret_score
