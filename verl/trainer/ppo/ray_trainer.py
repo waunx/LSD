@@ -31,6 +31,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
+from tensordict import TensorDict
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -1512,13 +1513,14 @@ class RayPPOTrainer:
 
         return ref_log_prob
 
-    def _compute_old_log_prob(self, batch: DataProto):
-        # TODO: remove step 1, 2, 4 after we make the whole training tensordict and padding free
-        # step 1: convert dataproto to tensordict.
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to nopadding
-        batch_td = left_right_2_no_padding(batch_td)
-        # step 3: add meta info
+    def _compute_old_log_prob(self, batch: DataProto | TensorDict):
+        if isinstance(batch, TensorDict):
+            batch_td = batch
+            restore_padding = False
+        else:
+            batch_td = left_right_2_no_padding(batch.to_tensordict())
+            restore_padding = True
+
         calculate_sum_pi_squared = self.config.actor_rollout_ref.actor.get("calculate_sum_pi_squared", False)
         tu.assign_non_tensor(
             batch_td,
@@ -1534,19 +1536,20 @@ class RayPPOTrainer:
         sum_pi_squared = tu.get(output, "sum_pi_squared") if calculate_sum_pi_squared else None
 
         old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
-        # step 4. No padding to padding
-        entropy = no_padding_2_padding(entropy, batch_td)
-        log_probs = no_padding_2_padding(log_probs, batch_td)
-        if sum_pi_squared is not None:
-            sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
-        # step 5: rebuild a tensordict and convert to dataproto
+        if restore_padding:
+            entropy = no_padding_2_padding(entropy, batch_td)
+            log_probs = no_padding_2_padding(log_probs, batch_td)
+            if sum_pi_squared is not None:
+                sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
+
         result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
         if routed_experts is not None:
             result["routed_experts"] = routed_experts
         if sum_pi_squared is not None:
             result["sum_pi_squared"] = sum_pi_squared.float()
         old_log_prob = tu.get_tensordict(result)
-        old_log_prob = DataProto.from_tensordict(old_log_prob)
+        if restore_padding:
+            old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
     def _update_actor(self, batch: DataProto) -> DataProto:
@@ -1807,6 +1810,7 @@ class RayPPOTrainer:
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
+                    # old log prob
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
                     # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
@@ -1826,10 +1830,12 @@ class RayPPOTrainer:
                         # 让 actor model 再 forward 一遍当前 batch ，重新算一遍 old_log_probs
                         # 优点：标准 稳定，缺点：要在跑一遍 forward
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            # recompute old log prob
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
                             actor_config = self.config.actor_rollout_ref.actor
+                            # 聚合 entropy 从 token level 到一个标量 
                             entropy_agg = agg_loss(
                                 loss_mat=entropys,
                                 loss_mask=response_masks,
@@ -1841,7 +1847,9 @@ class RayPPOTrainer:
                                 "perf/mfu/actor_infer": old_log_prob_mfu,
                             }
                             metrics.update(old_log_prob_metrics)
+                            # pop entropy （日志指标，不做训练用）
                             old_log_prob.batch.pop("entropys")
+                            # 冲突检查
                             if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
                                 raise ValueError(
                                     "Detected conflicting router replay configuration: "
@@ -1850,7 +1858,9 @@ class RayPPOTrainer:
                                     "The enable_rollout_routing_replay option is only used in R3 mode; "
                                     "it should not be set when using R2 mode."
                                 )
+                            # 存储 old_log_prob 训练用
                             batch = batch.union(old_log_prob)
+                            # 检查 π_rollout 和 π_old 的log_prob 差异，计算 debug metrics
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
@@ -1859,6 +1869,8 @@ class RayPPOTrainer:
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
+                    # ref log prob
+                    # ref model：冻结的初始学生模型 / 初始 actor 模型 / SFT base model ，用于KL约束
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
@@ -1866,6 +1878,7 @@ class RayPPOTrainer:
                             batch = batch.union(ref_log_prob)
 
                     # compute values
+                    # GRPO ，REMAX 不需要 critic
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
@@ -1880,17 +1893,20 @@ class RayPPOTrainer:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
+                        # 计算 kl 惩罚项，rewards = scores - kl penalty
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
                             metrics.update(kl_metrics)
                         else:
+                            # rewards = scores
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        # 只在 decoupled mode 启用，修正 π_rollout 和 π_old 不一致问题
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -1904,6 +1920,7 @@ class RayPPOTrainer:
                             metrics.update(is_metrics)
 
                         # compute advantages, executed on the driver process
+                        # 如果启用GPRO，选择是否除以 组内标准差
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
@@ -1919,6 +1936,7 @@ class RayPPOTrainer:
                         )
 
                     # update critic
+                    # GRPO ，REMAX 不需要 critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
@@ -1930,10 +1948,12 @@ class RayPPOTrainer:
                         # Still in critic warmup, only update weights to wake up rollout replicas.
                         self.checkpoint_manager.update_weights(self.global_steps)
                     else:
+                        # 核心 更新 actor
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
 
+                        # 保存 ckpt
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
@@ -1956,6 +1976,7 @@ class RayPPOTrainer:
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
 
+                        # 把 actor 里刚更新好的权重同步到 rollout engine，用于下一轮 response 的生成
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
