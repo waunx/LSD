@@ -106,14 +106,41 @@ def get_distillation_loss_settings(loss_name: str) -> DistillationLossSettings:
     return DISTILLATION_SETTINGS_REGISTRY[loss_name]
 
 
+def _to_padded_bool_mask(mask: torch.Tensor) -> torch.Tensor:
+    if mask.is_nested:
+        return mask.bool().to_padded_tensor(False)
+    return mask.bool()
+
+
+def _expand_response_mask(mask: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """Expand a per-sequence or token mask to the padded response-mask shape."""
+    response_mask = _to_padded_bool_mask(response_mask)
+    if mask.is_nested:
+        mask = mask.to_padded_tensor(False)
+    if mask.dim() == 1:
+        mask = mask[:, None]
+    return mask.to(device=response_mask.device).bool() & response_mask
+
+
+def _select_loss_mask(data: TensorDict, key: str, default_mask: torch.Tensor) -> torch.Tensor:
+    mask = data.get(key, None)
+    if mask is None:
+        return _to_padded_bool_mask(default_mask)
+    return _expand_response_mask(mask, default_mask)
+
+
 def compute_distillation_loss_range(
     distillation_losses: torch.Tensor, response_mask: torch.Tensor
 ) -> dict[str, Metric]:
     """Compute min and max distillation loss over valid response tokens."""
-    if response_mask.is_nested:
-        distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
-    else:
-        distillation_losses_response = distillation_losses[response_mask.bool()]
+    response_mask_bool = _to_padded_bool_mask(response_mask)
+    distillation_losses_response = distillation_losses[response_mask_bool]
+    if distillation_losses_response.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, zero),
+            "distillation/loss_max": Metric(AggregationType.MAX, zero),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -200,14 +227,47 @@ def distillation_ppo_loss(
     - student_logits is None, return the final policy loss scalar and metrics.
     """
 
+    distillation_loss_config = distillation_config.distillation_loss
+    opd_mode = getattr(distillation_loss_config, "opd_mode", "supervised")
+
     # Called as logits processor
+    # logits processor 阶段，给 supervised top-k distillation 用。
     if student_logits is not None:
+        if opd_mode == "rl":
+            return {}
         return compute_topk_loss(config, distillation_config, data, student_logits, data_format)
 
     # Called as final policy loss
-    distillation_loss_config = distillation_config.distillation_loss
+    if opd_mode == "rl":
+        # 在 RL-OPD 模式，最终 actor loss 就是普通 ppo_loss 的返回值。
+        policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+        # 日志兼容
+        # RL-OPD 下没有一个单独反传的 distillation loss scalar。
+        # distillation 已经以 reward shaping 的形式进入 advantages 了
+        zero = policy_loss.detach().new_zeros(())
+        policy_metrics["distillation/loss"] = Metric(value=zero, aggregation=AggregationType.SUM)
+        policy_metrics["distillation/easy_loss_coef"] = distillation_loss_config.distillation_loss_coef
+        policy_metrics["distillation/hard_loss_coef"] = getattr(distillation_loss_config, "hard_loss_coef", 1.0)
+        policy_metrics["distillation/opd_mode_rl"] = 1.0
+        return policy_loss, policy_metrics
+
+    # easy： distillation loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
-    policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
+
+    # hard：policy loss
+    if "rl_loss_mask" in data.keys():
+        data_for_policy = data.clone()
+        # rl_loss_mask: [batch_size, response_len]
+        rl_loss_mask = _select_loss_mask(data_for_policy, "rl_loss_mask", data_for_policy["response_mask"])
+        hard_loss_coef = getattr(distillation_loss_config, "hard_loss_coef", 1.0)
+        # 将 easy prompt 的 advantage 清零
+        data_for_policy["advantages"] = data_for_policy["advantages"] * rl_loss_mask.to(data_for_policy["advantages"])
+        data_for_policy["advantages"] = data_for_policy["advantages"] * hard_loss_coef
+    else:
+        data_for_policy = data
+        hard_loss_coef = getattr(distillation_loss_config, "hard_loss_coef", 1.0)
+
+    policy_loss, policy_metrics = ppo_loss(config, model_output, data_for_policy, dp_group)
     if not distillation_loss_config.use_task_rewards:
         policy_loss = 0.0
 
@@ -218,6 +278,8 @@ def distillation_ppo_loss(
     )
     policy_loss += distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+    policy_metrics["distillation/easy_loss_coef"] = distillation_loss_coef
+    policy_metrics["distillation/hard_loss_coef"] = hard_loss_coef
 
     return policy_loss, policy_metrics
 
@@ -237,25 +299,34 @@ def distillation_loss(
     """
     assert distillation_config is not None
     loss_config: DistillationLossConfig = distillation_config.distillation_loss
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+    # 选择何种 kl 作为 loss
     distillation_loss_fn = get_distillation_loss_fn(loss_config.loss_mode)
+    # 计算 student 和 teacher 的 kl —— token level loss
     distillation_losses, distillation_metrics = distillation_loss_fn(
         config=config,
         distillation_config=distillation_config,
         model_output=model_output,
         data=data,
     )
-    response_mask = data["response_mask"]
+    response_mask = _select_loss_mask(data, "distill_loss_mask", data["response_mask"])
     loss_agg_mode = config.loss_agg_mode
 
     distillation_metrics.update(
         compute_distillation_loss_range(distillation_losses=distillation_losses, response_mask=response_mask)
     )
+    # 限制 token-level distillation loss 的范围
     if loss_config.loss_max_clamp is not None:
         # clamping min is for k1 loss which can be negative
         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
 
+    # PG-OPD 分支
     if loss_config.use_policy_gradient:
         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
+        # 读取 policy loss function
         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
         for k, v in config.global_batch_info.items():
             loss_config.global_batch_info[k] = v
@@ -263,9 +334,8 @@ def distillation_loss(
         old_log_prob = data["old_log_probs"]
         if old_log_prob.is_nested:
             old_log_prob = data["old_log_probs"].to_padded_tensor(0.0)
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
         rollout_is_weights = data.get("rollout_is_weights", None)
+        # advantages = -distillation_losses.detach()
         distillation_loss, pg_metrics = policy_loss_fn(
             old_log_prob=old_log_prob,
             log_prob=log_prob,
@@ -277,10 +347,10 @@ def distillation_loss(
         )
         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
         distillation_metrics.update(pg_metrics)
+    # 监督 OPD 分支
+    # 直接对 token-level distillation_losses 做 mask 和聚合，得到 scalar loss，然后直接反传。
     else:
         # Directly backpropagate distillation loss as a supervised loss, as in https://arxiv.org/abs/2306.13649.
-        if response_mask.is_nested:
-            response_mask = response_mask.to_padded_tensor(False)
         distillation_loss = agg_loss(
             loss_mat=distillation_losses,
             loss_mask=response_mask,

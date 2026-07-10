@@ -272,7 +272,6 @@ class vLLMHttpServer:
             "max_num_batched_tokens": self.config.max_num_batched_tokens,
             "enable_prefix_caching": self.config.enable_prefix_caching,
             "enable_sleep_mode": self.config.enable_sleep_mode,
-            "logprobs_mode": self.config.logprobs_mode,
             "enforce_eager": self.config.enforce_eager,
             "gpu_memory_utilization": self.config.gpu_memory_utilization,
             "disable_log_stats": self.config.disable_log_stats,
@@ -285,6 +284,16 @@ class vLLMHttpServer:
             "compilation_config": compilation_config,
             **engine_kwargs,
         }
+
+        if self.config.logprobs_mode is not None:
+            if _VLLM_VERSION >= version.parse("0.10.0"):
+                args["logprobs_mode"] = self.config.logprobs_mode
+            else:
+                logger.warning(
+                    "Skipping logprobs_mode=%s because vLLM %s does not support the serve CLI argument.",
+                    self.config.logprobs_mode,
+                    _VLLM_VERSION,
+                )
 
         # update profiler args
         profiler_args = build_vllm_profiler_args(
@@ -407,7 +416,8 @@ class vLLMHttpServer:
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
         # Don't keep the dummy data in memory
-        await engine_client.reset_mm_cache()
+        if hasattr(engine_client, "reset_mm_cache"):
+            await engine_client.reset_mm_cache()
         await engine_client.collective_rpc(
             method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
         )
@@ -656,9 +666,9 @@ class vLLMHttpServer:
             # is a no-op success, so we can pass it unconditionally.
             await self.engine.reset_prefix_cache(**_RESET_PREFIX_CACHE_KWARGS)
 
-            if _VLLM_VERSION >= version.parse("0.9.0"):
+            if hasattr(self.engine, "reset_mm_cache"):
                 await self.engine.reset_mm_cache()
-            if _VLLM_VERSION >= version.parse("0.16.0"):
+            if hasattr(self.engine, "reset_encoder_cache"):
                 await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
@@ -694,7 +704,22 @@ class vLLMHttpServer:
         self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):
-        await self.engine.wait_for_requests_to_drain()
+        if hasattr(self.engine, "wait_for_requests_to_drain"):
+            await self.engine.wait_for_requests_to_drain()
+            return
+
+        output_processor = getattr(self.engine, "output_processor", None)
+        request_states = getattr(output_processor, "request_states", None)
+        if request_states is None:
+            logger.warning("Skipping wait_for_requests_to_drain: vLLM %s does not expose request states.", _VLLM_VERSION)
+            return
+
+        for _ in range(600):
+            if not request_states:
+                return
+            await asyncio.sleep(0.1)
+
+        logger.warning("Timed out waiting for %d vLLM requests to drain.", len(request_states))
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.

@@ -35,7 +35,9 @@ def _get_teacher_sampling_params(
     if teacher_model_config.inference.temperature != 1.0:
         raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
 
-    num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
+    num_logprobs = (
+        distillation_loss_config.topk if distillation_loss_config.uses_topk_teacher_logprobs else 0
+    )
     return {
         "max_tokens": 1,
         "temperature": teacher_model_config.inference.temperature,

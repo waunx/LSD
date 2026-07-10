@@ -22,7 +22,12 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = [
+    "DistillationLossConfig",
+    "EasyHardSplitConfig",
+    "DistillationTeacherModelConfig",
+    "DistillationConfig",
+]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -34,12 +39,19 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode (str):
         Distillation loss function to use.
+    opd_mode (str):
+        OPD training mode. "supervised" applies distillation as a direct loss; "rl" turns teacher
+        distillation into an easy-prompt reward before advantage computation.
+    rl_reward_loss_mode (str):
+        Single-sample KL estimator used to derive the teacher reward in opd_mode="rl".
     topk (int, optional):
         Number of top tokens to consider for top-k distillation losses.
     use_task_rewards (bool):
         Whether to include task rewards alongside distillation loss.
     distillation_loss_coef (float):
         Coefficient for distillation loss when combined with task rewards.
+    hard_loss_coef (float):
+        Coefficient for the RL policy loss on hard prompts when easy/hard split is enabled.
     loss_max_clamp (float, optional):
         Maximum value to clamp distillation loss. If None, no clamping is applied.
     log_prob_min_clamp (float, optional):
@@ -62,14 +74,17 @@ class DistillationLossConfig(BaseConfig):
         Runtime-populated settings based on loss_mode. Not set by user.
     """
 
-    loss_mode: str = "k3"
+    loss_mode: str = "forward_kl_topk"
+    opd_mode: str = "supervised"
+    rl_reward_loss_mode: str = "k3"
     topk: Optional[int] = 128
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
+    hard_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
     log_prob_min_clamp: Optional[float] = -10.0
 
-    use_policy_gradient: bool = True
+    use_policy_gradient: bool = False
     policy_loss_mode: str = "vanilla"
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
@@ -90,6 +105,20 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+        rl_reward_loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.rl_reward_loss_mode)
+
+        valid_opd_modes = {"supervised", "rl"}
+        if self.opd_mode not in valid_opd_modes:
+            raise ValueError(f"opd_mode must be one of {sorted(valid_opd_modes)}, got {self.opd_mode!r}.")
+
+        if self.opd_mode == "rl":
+            if not rl_reward_loss_settings.use_estimator:
+                raise ValueError(
+                    "opd_mode='rl' requires rl_reward_loss_mode to be a single-sample KL estimator, "
+                    f"but got {self.rl_reward_loss_mode!r}."
+                )
+            if not self.use_task_rewards:
+                raise ValueError("opd_mode='rl' requires use_task_rewards=True.")
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -109,6 +138,56 @@ class DistillationLossConfig(BaseConfig):
             raise ValueError(
                 "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
                 " wrt model weights does not depend on teacher log probabilities."
+            )
+
+    @property
+    def uses_topk_teacher_logprobs(self) -> bool:
+        return self.opd_mode == "supervised" and self.loss_settings.use_topk
+
+
+@dataclass
+class EasyHardSplitConfig(BaseConfig):
+    """Configuration for routing prompts to easy distillation or hard RL losses.
+
+    enabled (bool):
+        Whether to enable easy/hard routing.
+    mode (str):
+        "online" computes prompt difficulty from the current policy rollout rewards;
+        "offline" consumes a teacher-generated JSONL label file and falls back according to
+        offline_missing_policy.
+    accuracy_threshold (float):
+        Prompts with group accuracy greater than this threshold are easy.
+    score_key (str):
+        Reward-extra key to use for correctness, typically "acc". If missing, summed reward is used.
+    reward_score_threshold (float):
+        Threshold for converting summed reward to correctness when score_key is unavailable.
+    offline_label_path (str, optional):
+        JSONL file produced by a teacher rollout. Supports one row per rollout with "input"/"score",
+        or one row per prompt with "prompt"/"outputs".
+    offline_missing_policy (str):
+        What to do when an offline prompt label is missing: "online", "hard", "easy", or "error".
+    """
+
+    enabled: bool = False
+    mode: str = "online"
+    accuracy_threshold: float = 0.5
+    score_key: str = "acc"
+    reward_score_threshold: float = 0.0
+    offline_label_path: Optional[str] = None
+    offline_prompt_key: str = "input"
+    offline_score_key: str = "score"
+    offline_acc_key: str = "acc"
+    offline_missing_policy: str = "online"
+
+    def __post_init__(self):
+        valid_modes = {"online", "offline"}
+        if self.mode not in valid_modes:
+            raise ValueError(f"easy_hard_split.mode must be one of {sorted(valid_modes)}, got {self.mode!r}.")
+        valid_missing = {"online", "hard", "easy", "error"}
+        if self.offline_missing_policy not in valid_missing:
+            raise ValueError(
+                "easy_hard_split.offline_missing_policy must be one of "
+                f"{sorted(valid_missing)}, got {self.offline_missing_policy!r}."
             )
 
 
@@ -253,6 +332,7 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    easy_hard_split: EasyHardSplitConfig = field(default_factory=EasyHardSplitConfig)
 
     def __post_init__(self):
         if not self.enabled:
@@ -262,7 +342,7 @@ class DistillationConfig(BaseConfig):
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
-                use_topk=self.distillation_loss.loss_settings.use_topk,
+                use_topk=self.distillation_loss.uses_topk_teacher_logprobs,
                 topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size

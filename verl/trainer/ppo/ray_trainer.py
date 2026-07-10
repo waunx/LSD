@@ -372,6 +372,7 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._easy_hard_offline_labels = None
         self._init_dump_executor()
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -457,30 +458,69 @@ class RayPPOTrainer:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
     @staticmethod
-    def _write_generations(inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+    def _write_generations_to_file(inputs, outputs, gts, scores, reward_extra_infos_dict, filename, mode):
         """Write generation samples as JSONL (runs in background thread)."""
-        os.makedirs(dump_path, exist_ok=True)
-        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
-
         n = len(inputs)
         base_data = {
             "input": inputs,
             "output": outputs,
             "gts": gts,
             "score": scores,
-            "step": [global_steps] * n,
         }
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
                 base_data[k] = v
 
-        with open(filename, "w") as f:
+        with open(filename, mode) as f:
             for i in range(n):
                 entry = {k: v[i] for k, v in base_data.items()}
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
+    @classmethod
+    def _write_generations(cls, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps):
+        """Write full validation/rollout samples as JSONL (runs in background thread)."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{global_steps}.jsonl")
+        reward_extra_infos_dict = dict(reward_extra_infos_dict)
+        reward_extra_infos_dict["step"] = [global_steps] * len(inputs)
+        cls._write_generations_to_file(
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            filename,
+            "w",
+        )
         print(f"Dumped generations to {filename}")
+        partial_filename = os.path.join(dump_path, f"{global_steps}.partial.jsonl")
+        if os.path.exists(partial_filename):
+            try:
+                os.remove(partial_filename)
+                print(f"Removed partial validation generations {partial_filename}")
+            except OSError as e:
+                print(f"Warning: failed to remove partial validation generations {partial_filename}: {e}")
+
+    @classmethod
+    def _append_partial_generations(
+        cls, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps
+    ):
+        """Append one validation batch to a partial JSONL file for crash/interruption recovery."""
+        os.makedirs(dump_path, exist_ok=True)
+        filename = os.path.join(dump_path, f"{global_steps}.partial.jsonl")
+        reward_extra_infos_dict = dict(reward_extra_infos_dict)
+        reward_extra_infos_dict["step"] = [global_steps] * len(inputs)
+        cls._write_generations_to_file(
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            filename,
+            "a",
+        )
+        print(f"Appended partial validation generations to {filename}")
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL asynchronously."""
@@ -501,6 +541,28 @@ class RayPPOTrainer:
         for f in self._dump_futures:
             if f.done():
                 f.result()  # re-raises if the write failed
+            else:
+                still_pending.append(f)
+        self._dump_futures = still_pending
+
+    def _dump_partial_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+        """Append rollout/validation samples as JSONL asynchronously."""
+        global_steps = self.global_steps
+        future = self._dump_executor.submit(
+            self._append_partial_generations,
+            inputs,
+            outputs,
+            gts,
+            scores,
+            reward_extra_infos_dict,
+            dump_path,
+            global_steps,
+        )
+        self._dump_futures.append(future)
+        still_pending = []
+        for f in self._dump_futures:
+            if f.done():
+                f.result()
             else:
                 still_pending.append(f)
         self._dump_futures = still_pending
@@ -818,6 +880,336 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _get_easy_hard_split_config(self):
+        distillation_config = self.config.get("distillation")
+        if not is_distillation_enabled(distillation_config):
+            return None
+        return distillation_config.get("easy_hard_split", None)
+
+    def _is_easy_hard_split_enabled(self) -> bool:
+        split_config = self._get_easy_hard_split_config()
+        return bool(split_config is not None and split_config.get("enabled", False))
+
+    def _is_rl_opd_enabled(self) -> bool:
+        distillation_config = self.config.get("distillation")
+        if not is_distillation_enabled(distillation_config):
+            return False
+        distillation_loss_config = distillation_config.get("distillation_loss", {})
+        return distillation_loss_config.get("opd_mode", "supervised") == "rl"
+
+    @staticmethod
+    def _teacher_response_log_probs(batch: DataProto) -> torch.Tensor:
+        if "teacher_logprobs" not in batch.batch:
+            raise ValueError("opd_mode='rl' requires teacher_logprobs in the rollout batch.")
+
+        teacher_logprobs = batch.batch["teacher_logprobs"]
+        if teacher_logprobs.dim() == 3:
+            if teacher_logprobs.shape[-1] != 1:
+                raise ValueError(
+                    "opd_mode='rl' requires sampled-token teacher logprobs, but teacher_logprobs "
+                    f"has last dimension {teacher_logprobs.shape[-1]}. Use a single-sample loss mode for RL OPD."
+                )
+            teacher_logprobs = teacher_logprobs.squeeze(-1)
+        elif teacher_logprobs.dim() != 2:
+            raise ValueError(f"Unexpected teacher_logprobs shape for RL OPD: {tuple(teacher_logprobs.shape)}")
+
+        response_width = batch.batch["responses"].shape[1]
+        if teacher_logprobs.shape[1] == response_width:
+            return teacher_logprobs
+
+        prompt_width = batch.batch["prompts"].shape[1]
+        start = prompt_width - 1
+        end = start + response_width
+        if start < 0 or end > teacher_logprobs.shape[1]:
+            raise ValueError(
+                "Cannot align teacher_logprobs to response tokens: "
+                f"{teacher_logprobs.shape=}, {prompt_width=}, {response_width=}."
+            )
+        return teacher_logprobs[:, start:end]
+
+    def _apply_rl_opd_rewards(self, batch: DataProto) -> dict[str, float]:
+        # 如果不启用，返回空字典
+        if not self._is_rl_opd_enabled():
+            return {}
+        if "distill_loss_mask" not in batch.batch:
+            raise ValueError("opd_mode='rl' requires easy/hard split masks before advantage computation.")
+        if "old_log_probs" not in batch.batch:
+            raise ValueError("opd_mode='rl' requires old_log_probs before advantage computation.")
+
+        # 读取 distillation_loss 配置
+        distillation_loss_config = self.config.distillation.distillation_loss
+        # 取 teacher logprob 并对齐 response （去掉 prompt 部分）
+        teacher_log_probs = self._teacher_response_log_probs(batch).to(batch.batch["old_log_probs"].device)
+        old_log_probs = batch.batch["old_log_probs"]
+        response_mask = batch.batch["response_mask"].bool()
+        distill_loss_mask = batch.batch["distill_loss_mask"].bool()
+        if teacher_log_probs.shape != old_log_probs.shape:
+            raise ValueError(
+                "teacher_logprobs and old_log_probs must align for RL OPD reward computation, "
+                f"but got {teacher_log_probs.shape=} and {old_log_probs.shape=}."
+            )
+
+        # 计算 kl estimator （loss_mode=rl时，采用 - reverse KL 作为 reward）
+        # logprob     = log pi_old(a_t | s_t)
+        # ref_logprob = log pi_teacher(a_t | s_t)
+        # kl = log pi_teacher - log pi_old
+        # ratio = pi_teacher / pi_old
+        # k3 = ratio - log(ratio) - 1
+        # 这个值非负，越接近 0 表示 old policy 和 teacher 在这个 token 上越接近；
+        # 差异越大，penalty 越大。它是在 sampled token 上估计 KL(pi_old || pi_teacher)。
+        distill_losses = core_algos.kl_penalty(
+            logprob=old_log_probs,
+            ref_logprob=teacher_log_probs,
+            kl_penalty=distillation_loss_config.get("rl_reward_loss_mode", "k3"),
+        )
+
+        # 做 clip 防止极端 logprob 差异导致 reward 爆掉
+        loss_max_clamp = distillation_loss_config.get("loss_max_clamp", None)
+        if loss_max_clamp is not None:
+            distill_losses = distill_losses.clamp(min=-loss_max_clamp, max=loss_max_clamp)
+
+        # 将 loss 转换为 teacher_reward （reward 中的 opd 部分）
+        # 只给 easy prompt 的 response token 加 teacher reward。
+        # hard prompt 和 padding token 都乘成 0。
+        reward_coef = float(distillation_loss_config.get("distillation_loss_coef", 1.0))
+        teacher_rewards = -distill_losses.detach() * distill_loss_mask.to(distill_losses)
+        batch.batch["teacher_distill_rewards"] = teacher_rewards
+        # easy prompt: token_level_rewards = task_reward - teacher_rewards
+        # hard prompt: token_level_rewards = task_reward
+        batch.batch["token_level_rewards"] = batch.batch["token_level_rewards"] + reward_coef * teacher_rewards
+
+        # 在 easy 的有效 response token 上统计指标
+        easy_tokens = distill_loss_mask & response_mask
+        if easy_tokens.any():
+            easy_reward_mean = teacher_rewards[easy_tokens].mean().item()
+            easy_reward_sum = teacher_rewards[easy_tokens].sum().item()
+            easy_loss_mean = distill_losses[easy_tokens].mean().item()
+        else:
+            easy_reward_mean = 0.0
+            easy_reward_sum = 0.0
+            easy_loss_mean = 0.0
+        return {
+            "distillation/rl_reward_coef": reward_coef,
+            "distillation/rl_teacher_reward_mean": easy_reward_mean,
+            "distillation/rl_teacher_reward_sum": easy_reward_sum,
+            "distillation/rl_teacher_loss_mean": easy_loss_mean,
+        }
+
+    @staticmethod
+    def _prompt_hash(prompt: str) -> str:
+        return hashlib.sha1(str(prompt).encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _to_float_score(value) -> float:
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return 0.0
+            if value.size == 1:
+                value = value.item()
+            else:
+                return float(np.asarray(value, dtype=np.float32).mean())
+        if isinstance(value, (bool, np.bool_)):
+            return float(value)
+        if value is None:
+            return 0.0
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "correct"}:
+                return 1.0
+            if lowered in {"false", "no", "incorrect"}:
+                return 0.0
+        return float(value)
+
+    def _load_easy_hard_offline_labels(self) -> dict[str, bool]:
+        # 缓存 只读一次
+        if self._easy_hard_offline_labels is not None:
+            return self._easy_hard_offline_labels
+
+        # 如果没有配置 split ，直接返回空字典
+        split_config = self._get_easy_hard_split_config()
+        if split_config is None:
+            self._easy_hard_offline_labels = {}
+            return self._easy_hard_offline_labels
+
+        # offline 模式必须提供离线 label 文件路径 否则报错
+        label_path = split_config.get("offline_label_path", None)
+        if not label_path:
+            raise ValueError("distillation.easy_hard_split.offline_label_path is required when mode='offline'.")
+
+        # 读取 jsonl 中字段名
+        prompt_key = split_config.get("offline_prompt_key", "input")
+        score_key = split_config.get("offline_score_key", "score")
+        acc_key = split_config.get("offline_acc_key", "acc")
+
+        # 提取阈值
+        threshold = float(split_config.get("accuracy_threshold", 0.5))
+
+        prompt_scores: dict[str, list[float]] = defaultdict(list)
+        with open(label_path, encoding="utf-8") as f:
+            # 逐行读取 jsonl
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+
+                # 提取 prompt 并构造 key
+                prompt = record.get(prompt_key, record.get("input", record.get("prompt", None)))
+                prompt_keys = set()
+                if prompt is not None:
+                    prompt = str(prompt)
+                    prompt_keys.add(self._prompt_hash(prompt))
+                    prompt_keys.add(self._prompt_hash(prompt.strip()))
+                # 如果 jsonl 中有prompt_id 也可以作为一个可匹配的key
+                # （一个 prompt 可能对应多个 key）
+                if record.get("prompt_id") is not None:
+                    prompt_keys.add(str(record["prompt_id"]))
+                if not prompt_keys:
+                    continue
+
+                # 提取分数
+                scores = []
+                outputs = record.get("outputs", None)
+                # 如果一行里有多个 outputs
+                if isinstance(outputs, list):
+                    for output_record in outputs:
+                        if not isinstance(output_record, dict):
+                            continue
+                        # 优先读 acc，其次读 score。
+                        raw_score = output_record.get(
+                            acc_key,
+                            output_record.get(score_key, output_record.get("score")),
+                        )
+                        # 将值转成 float
+                        scores.append(self._to_float_score(raw_score))
+                # 如果一行就是一次 rollout 或一个 prompt 的分数
+                else:
+                    raw_score = record.get(acc_key, record.get(score_key, record.get("reward", record.get("score"))))
+                    scores.append(self._to_float_score(raw_score))
+
+                # 给同一个 prompt 的所有 key 都挂上分数
+                for key in prompt_keys:
+                    prompt_scores[key].extend(scores)
+
+        # 对每个 prompt 的 scores 取平均
+        # 这里用的是大于 不是大于等于
+        self._easy_hard_offline_labels = {
+            key: (float(np.mean(scores)) > threshold) for key, scores in prompt_scores.items() if scores
+        }
+        # 打印加载了多少个 prompt key
+        print(
+            "Loaded easy/hard offline labels: "
+            f"{len(self._easy_hard_offline_labels)} prompt keys from {label_path}"
+        )
+        return self._easy_hard_offline_labels
+
+    def _extract_correctness_scores(self, reward_tensor: torch.Tensor, reward_extra_infos_dict: dict, split_config):
+        score_key = split_config.get("score_key", "acc")
+        if score_key in reward_extra_infos_dict:
+            raw_scores = reward_extra_infos_dict[score_key]
+            return np.array([self._to_float_score(value) for value in raw_scores], dtype=np.float32)
+
+        reward_scores = reward_tensor.sum(dim=-1).detach().cpu().float().numpy()
+        reward_score_threshold = float(split_config.get("reward_score_threshold", 0.0))
+        return (reward_scores > reward_score_threshold).astype(np.float32)
+
+    def _online_easy_hard_labels(self, uids, correctness_scores: np.ndarray, threshold: float):
+        uid_to_indices: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(uids):
+            uid_to_indices[str(uid)].append(idx)
+
+        easy = np.zeros(len(correctness_scores), dtype=bool)
+        group_acc = np.zeros(len(correctness_scores), dtype=np.float32)
+        for indices in uid_to_indices.values():
+            acc = float(np.mean(correctness_scores[indices]))
+            is_easy = acc > threshold
+            easy[indices] = is_easy
+            group_acc[indices] = acc
+        return easy, group_acc
+
+    def _attach_easy_hard_masks(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: dict,
+    ) -> dict[str, float]:
+        # 读取配置
+        split_config = self._get_easy_hard_split_config()
+        if split_config is None:
+            return {}
+
+        # 读取阈值、分数、计算 online easy 标签
+        threshold = float(split_config.get("accuracy_threshold", 0.5))
+        correctness_scores = self._extract_correctness_scores(reward_tensor, reward_extra_infos_dict, split_config)
+        online_easy, group_acc = self._online_easy_hard_labels(
+            batch.non_tensor_batch["uid"], correctness_scores, threshold
+        )
+
+        missing_count = 0
+        mode = split_config.get("mode", "online")
+        if mode == "offline":
+            # 从离线 jsonl 文件读取每个 prompt 的正确率，然后判断属于 easy/hard，并缓存成一个字典。
+            offline_labels = self._load_easy_hard_offline_labels()
+            # 把当前训练 batch 里的 prompt token ids 解码回文本
+            prompts = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            # 数据缺失策略
+            offline_missing_policy = split_config.get("offline_missing_policy", "online")
+            # 初始化，默认全hard
+            easy = np.zeros_like(online_easy)
+            # 遍历当前 batch 中每个 prompt
+            for idx, prompt in enumerate(prompts):
+                # 为当前 prompt 构造两个候选 key，容忍首尾空格不同的情况
+                candidate_keys = (self._prompt_hash(prompt), self._prompt_hash(str(prompt).strip()))
+                # 离线 label 字典里查这两个 key。如果任意一个 key 存在，就拿到对应 label。
+                label = next((offline_labels[key] for key in candidate_keys if key in offline_labels), None)
+                # 如果离线 label 缺失，根据缺失策略用在线 label 填充，或者直接填成 easy/hard，或者报错。
+                if label is None:
+                    missing_count += 1
+                    if offline_missing_policy == "online":
+                        label = bool(online_easy[idx])
+                    elif offline_missing_policy == "hard":
+                        label = False
+                    elif offline_missing_policy == "easy":
+                        label = True
+                    else:
+                        raise KeyError(
+                            "Missing offline easy/hard label for prompt hash "
+                            f"{candidate_keys[0]} and offline_missing_policy='error'."
+                        )
+                easy[idx] = bool(label)
+        else:
+            easy = online_easy
+
+        # 把 easy/hard 结果写进 batch，供后面的 loss 使用。
+        response_mask = batch.batch["response_mask"].bool()
+        easy_mask = torch.tensor(easy, dtype=torch.bool, device=response_mask.device)
+        hard_mask = ~easy_mask
+        batch.batch["easy_mask"] = easy_mask
+        batch.batch["hard_mask"] = hard_mask
+        # 构造 token-level loss mask
+        # easy_mask[:, None] 把 shape 从 [B] 变成 [B, 1]，这样可以和 [B, T] 的 response_mask 广播。
+        batch.batch["distill_loss_mask"] = response_mask & easy_mask[:, None] # easy 样本走 distillation
+        batch.batch["rl_loss_mask"] = response_mask & hard_mask[:, None] # hard 样本走 rl grpo
+        # 记录非 tensor 标签
+        batch.non_tensor_batch["easy_hard_label"] = np.array(
+            ["easy" if is_easy else "hard" for is_easy in easy], dtype=object
+        )
+        # 记录组内准确率
+        batch.non_tensor_batch["easy_hard_group_acc"] = group_acc
+
+        # 统计 easy/hard token 数
+        total_tokens = max(float(response_mask.sum().item()), 1.0)
+        easy_tokens = float(batch.batch["distill_loss_mask"].sum().item())
+        hard_tokens = float(batch.batch["rl_loss_mask"].sum().item())
+        return {
+            "easy_hard/easy_sample_ratio": float(np.mean(easy)) if len(easy) else 0.0,
+            "easy_hard/hard_sample_ratio": float(np.mean(~easy)) if len(easy) else 0.0,
+            "easy_hard/easy_token_ratio": easy_tokens / total_tokens,
+            "easy_hard/hard_token_ratio": hard_tokens / total_tokens,
+            "easy_hard/group_acc_mean": float(np.mean(group_acc)) if len(group_acc) else 0.0,
+            "easy_hard/offline_missing_ratio": missing_count / max(len(easy), 1),
+        }
+
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
         compute reward use colocate reward model
@@ -829,6 +1221,11 @@ class RayPPOTrainer:
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            partial_filename = os.path.join(val_data_dir, f"{self.global_steps}.partial.jsonl")
+            if os.path.exists(partial_filename):
+                os.remove(partial_filename)
 
         # Lists to collect samples for the table
         sample_inputs = []
@@ -918,14 +1315,27 @@ class RayPPOTrainer:
             sample_scores.extend(scores)
 
             # reward_extra_infos_dict
+            batch_reward_extra_infos_dict = {"reward": scores}
             reward_extra_infos_dict["reward"].extend(scores)
             for key, values in reward_extra_info.items():
+                if isinstance(values, np.ndarray):
+                    batch_values = values.tolist()
+                else:
+                    batch_values = values if isinstance(values, list) else [values]
+                batch_reward_extra_infos_dict[key] = batch_values
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+                reward_extra_infos_dict[key].extend(batch_values)
+
+            if val_data_dir:
+                self._dump_partial_generations(
+                    inputs=input_texts,
+                    outputs=output_texts,
+                    gts=ground_truths,
+                    scores=scores,
+                    reward_extra_infos_dict=batch_reward_extra_infos_dict,
+                    dump_path=val_data_dir,
+                )
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -938,7 +1348,6 @@ class RayPPOTrainer:
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores) # 抽样 swanlab
 
         # dump generations
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
             # 保存验证数据 prompt / response / ground truth / reward / reward_extra_infos_dict
             self._dump_generations(
@@ -1210,8 +1619,8 @@ class RayPPOTrainer:
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
-            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+            llm_client=self.llm_server_manager.get_client(), # student
+            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None, # teacher
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
 
@@ -1565,7 +1974,7 @@ class RayPPOTrainer:
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
         distillation_use_topk = (
-            self.distillation_config.distillation_loss.loss_settings.use_topk
+            self.distillation_config.distillation_loss.uses_topk_teacher_logprobs
             if is_distillation_enabled(self.config.get("distillation"))
             else False
         )
@@ -1738,6 +2147,8 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
                         # 核心：generate_sequences
+                        # generate_sequences: student rollout，如果传入了 teacher_client 还会计算 teacher logprob
+                        # 这里 teacher 不生成答案，而是对 student 已经生成的 prompt + response token 序列 计算 logprob
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
                         # sleep rollout model
                         self.checkpoint_manager.sleep_replicas()
@@ -1889,11 +2300,17 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
 
+                        # 获取 easy / hard mask
+                        if self._is_easy_hard_split_enabled():
+                            metrics.update(
+                                self._attach_easy_hard_masks(batch, reward_tensor, reward_extra_infos_dict)
+                            )
+
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
-                        # 计算 kl 惩罚项，rewards = scores - kl penalty
+                        # compute task reward
+                        # apply_kl_penalty if available，计算 kl 惩罚项，rewards = scores - kl penalty
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
@@ -1902,6 +2319,9 @@ class RayPPOTrainer:
                         else:
                             # rewards = scores
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+
+                        # 计算 teacher reward 并合并 task reward（只在 opd_mode=rl 时启用）
+                        metrics.update(self._apply_rl_opd_rewards(batch))
 
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -1925,6 +2345,7 @@ class RayPPOTrainer:
                             "norm_adv_by_std_in_grpo", True
                         )  # GRPO adv normalization factor
 
+                        # opd脚本下，advantage仍被计算，其基于“rm_scores”计算，但rollout n=1，最终结果被清零，不影响训练
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,

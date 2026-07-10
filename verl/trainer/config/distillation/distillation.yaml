@@ -21,7 +21,15 @@ distillation_loss:
 
 
   # Loss function mode for distillation
-  loss_mode: k3
+  loss_mode: forward_kl_topk
+
+  # OPD training mode: supervised or rl.
+  # supervised: easy prompts receive direct distillation loss.
+  # rl: easy prompts add teacher distillation reward before advantage computation.
+  opd_mode: supervised
+
+  # Single-sample KL estimator used as teacher reward when opd_mode=rl.
+  rl_reward_loss_mode: k3
 
   # If distillation loss requires top-k logits, this is the value of k
   topk: 32
@@ -32,6 +40,9 @@ distillation_loss:
 
   # The coef of the distillation loss when use_task_rewards is true
   distillation_loss_coef: 1.0
+
+  # The coef of the RL policy-gradient loss on hard prompts when easy/hard split is enabled.
+  hard_loss_coef: 1.0
 
   # Optional max clamp value for distillation loss. If null, no clamping is applied.
   loss_max_clamp: null
@@ -53,6 +64,40 @@ distillation_loss:
 
   # Upper bound for PPO clipping ratio.
   clip_ratio_high: 0.2
+
+
+# Easy/hard routing config. Easy prompts receive distillation loss; hard prompts receive RL loss.
+easy_hard_split:
+
+  # Whether to enable easy/hard routing.
+  enabled: false
+
+  # Difficulty labeling mode: online or offline.
+  mode: online
+
+  # Prompts with group accuracy greater than this threshold are easy.
+  accuracy_threshold: 0.5
+
+  # Reward-extra field used as correctness, usually acc.
+  score_key: acc
+
+  # Threshold for summed reward when score_key is unavailable.
+  reward_score_threshold: 0.0
+
+  # Teacher-generated JSONL label file used in offline mode.
+  offline_label_path: null
+
+  # Prompt field name in the offline JSONL file.
+  offline_prompt_key: input
+
+  # Score field name in the offline JSONL file.
+  offline_score_key: score
+
+  # Accuracy field name in the offline JSONL file.
+  offline_acc_key: acc
+
+  # Missing-label policy in offline mode: online, hard, easy, or error.
+  offline_missing_policy: online
 
 
 # Number of GPUs per node in the distillation teacher resource pool

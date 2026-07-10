@@ -10,10 +10,17 @@ set -xeuo pipefail
 # ---- user-adjustable ----
 # DEVICE is auto-detected by probing torch_npu; override only for special cases.
 DEVICE=${DEVICE:-$(python3 -c 'import torch_npu' 2>/dev/null && echo npu || echo gpu)}
-INFER_BACKEND=vllm
+# ---- user-adjustable ----
+DEVICE=${DEVICE:-gpu}
+INFER_BACKEND=${INFER_BACKEND:-vllm}
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+# INFER_BACKEND=vllm
 export VLLM_USE_V1=1
 MODEL_PATH="/data/wx_data/models/Qwen3-4B-Base"
-TRAIN_FILE="['/data/wx_data/datasets/OPD/DAPO-Math-17k/data/dapo-math-17k.parquet']"
+# MODEL_PATH="/data/wx_data/verl-lsd/checkpoints/length_scaling/0609-qwen3_4b_base-math-4k-train_data_deepseek_rl-1/global_step_234/actor"
+TRAIN_FILE="['/data/wx_data/datasets/DeepScaleR/deepscaler_train_math.parquet']"
 TEST_FILE="['/data/wx_data/datasets/LSD/aime.parquet','/data/wx_data/datasets/LSD/amc.parquet','/data/wx_data/datasets/LSD/math.parquet','/data/wx_data/datasets/LSD/minerva.parquet','/data/wx_data/datasets/LSD/olympiad_bench.parquet']"
 # 主机数
 NNODES=1
@@ -40,9 +47,12 @@ ROLLOUT_TP=4
 ROLLOUT_GPU_MEM_UTIL=0.6
 ROLLOUT_N=8
 VAL_N=8
+VAL_TEMPERATURE=0.0
+VAL_TOP_P=1.0
+VAL_TOP_K=-1
 
 PROJECT_NAME=length_scaling
-EXPERIMENT_NAME=0609-qwen3_4b_base-math-4k-3
+EXPERIMENT_NAME=0609-qwen3_4b_base-math-4k-train_data_deepseek_rl-1
 VALIDATION_DATA_DIR=${VALIDATION_DATA_DIR:-"/data/wx_data/verl-lsd/outputs/${EXPERIMENT_NAME}/validation_data"}
 SAVE_FREQ=20
 TEST_FREQ=5
@@ -117,6 +127,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096
     actor_rollout_ref.rollout.n=${ROLLOUT_N}
     actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True
+    actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_TEMPERATURE}
+    actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_TOP_P}
+    actor_rollout_ref.rollout.val_kwargs.top_k=${VAL_TOP_K}
 )
 
 REF=(

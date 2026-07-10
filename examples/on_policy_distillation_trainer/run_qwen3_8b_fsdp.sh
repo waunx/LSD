@@ -25,6 +25,7 @@ actor_lr=${ACTOR_LR:-1e-6}
 
 rollout_tp=${ROLLOUT_TP:-2}
 rollout_gpu_mem_util=${ROLLOUT_GPU_MEM_UTIL:-0.4}
+# 因为 teacher 只负责算 logprob，不训练。启动多个 replica 可以并行处理 student rollout 后的大量 teacher logprob 请求，提高吞吐。
 teacher_tp=${TEACHER_TP:-2}
 teacher_gpu_mem_util=${TEACHER_GPU_MEM_UTIL:-0.4}
 

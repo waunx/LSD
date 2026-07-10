@@ -597,7 +597,9 @@ class AgentLoopWorker:
                 data_config=DictConfigWrap(self.config.data),
                 tools=ToolListWrap(self.tools),
             )
+            # 学生模型返回 rollout 结果
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
+            # 如果启用 OPD 计算 teacher logprob
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
 
     def _pad_token_ids(
@@ -717,6 +719,7 @@ class AgentLoopWorker:
             ),
         )
         await self._compute_score([output], kwargs=kwargs)
+        # 计算 teacher_logprobs
         await self._compute_teacher_logprobs(
             output,
             prompt_ids=output.prompt_ids,
@@ -917,6 +920,8 @@ class AgentLoopWorker:
                 if routing_value is not None:
                     # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
                     routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+            # 计算 teacher_logprobs
+            # 这里传给 teacher 的是学生刚刚生成出来的完整序列。teacher 不重新生成答案，而是在这条学生轨迹上算 logprob。
             teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
                 sequence_ids=prompt_ids + response_ids,
                 multi_modal_data=output.multi_modal_data,
