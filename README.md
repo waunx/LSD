@@ -1,4 +1,4 @@
-# LSD — Length-Scaling Distillation
+# LSD
 
 Code for **Mitigating the Length-Scaling Tax with Online Distillation**.
 
