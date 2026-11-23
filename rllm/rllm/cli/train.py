@@ -1,0 +1,667 @@
+"""Train CLI command.
+
+``rllm train <benchmark> --model <name> [OPTIONS]``
+
+Reuses the eval framework's dataset catalog, AgentFlows, and Evaluators to run
+RL training via the Tinker backend. Routes every rollout through
+``AgentFlowEngine`` (the same engine eval uses); for sandbox-style harnesses
+and harbor-sourced datasets, ``SandboxTaskHooks`` provides per-task sandbox lifecycle
+and per-task verifier resolution.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import click
+
+from rllm.cli._pull import load_dataset_catalog, pull_dataset
+from rllm.cli._sampling import SAMPLING_PARAMS_HELP as _SAMPLING_PARAMS_HELP
+from rllm.cli._ui import console, fail, info_panel
+
+# Path to the bundled YAML config templates
+_CONFIG_PKG = Path(__file__).resolve().parent.parent / "trainer" / "config"
+
+
+# ---------------------------------------------------------------------------
+# 1. build_train_config  — CLI flags → OmegaConf DictConfig
+# ---------------------------------------------------------------------------
+
+
+def build_train_config(
+    *,
+    model_name: str,
+    group_size: int,
+    batch_size: int,
+    lr: float,
+    lora_rank: int,
+    total_epochs: int,
+    total_steps: int | None,
+    val_freq: int,
+    save_freq: int,
+    project: str,
+    experiment: str,
+    output_dir: str | None,
+    config_file: str | None,
+):
+    """Build an OmegaConf DictConfig from YAML templates + CLI overrides.
+
+    Produces the same structure that Hydra's ``@hydra.main`` with
+    ``unified.yaml`` would produce, without requiring the Hydra runtime.
+    """
+    from omegaconf import OmegaConf
+
+    # Load the two template files
+    base_cfg = OmegaConf.load(str(_CONFIG_PKG / "rllm" / "base.yaml"))
+    tinker_cfg = OmegaConf.load(str(_CONFIG_PKG / "rllm" / "backend" / "tinker.yaml"))
+
+    # tinker.yaml has a top-level ``rllm:`` key with backend-specific overrides
+    # that should merge into the ``rllm`` namespace.
+    tinker_rllm = OmegaConf.to_container(tinker_cfg.get("rllm", {}), resolve=False)
+    tinker_top = OmegaConf.to_container(tinker_cfg, resolve=False)
+    tinker_top.pop("rllm", None)
+
+    # Merge: base → rllm key, tinker top-level, tinker rllm overrides
+    merged = OmegaConf.merge(
+        {"rllm": base_cfg},
+        OmegaConf.create(tinker_top),
+        {"rllm": OmegaConf.create(tinker_rllm)},
+    )
+
+    # If user provided a --config file, merge it on top
+    user_workflow_timeout = None
+    if config_file:
+        user_cfg = OmegaConf.load(config_file)
+        merged = OmegaConf.merge(merged, user_cfg)
+        # The CLI override block below sets a rollout timeout default; a
+        # timeout declared in the user's --config must survive it.
+        user_workflow_timeout = OmegaConf.select(user_cfg, "rllm.workflow.workflow_args.timeout")
+
+    # Apply CLI overrides (only non-default values)
+    overrides = OmegaConf.create(
+        {
+            "model": {"name": model_name, "lora_rank": lora_rank},
+            "training": {"group_size": group_size, "learning_rate": lr},
+            "validation": {"group_size": group_size},
+            "data": {"train_batch_size": batch_size},
+            "rllm": {
+                "model_name": model_name,
+                # Post-#627 the loader reads rllm.data directly, so the CLI batch
+                # size must land here too (sync_config keeps the native data.* in
+                # parity); writing both keeps them consistent before sync runs.
+                "data": {"train_batch_size": batch_size},
+                "trainer": {
+                    "total_epochs": total_epochs,
+                    "test_freq": val_freq,
+                    "save_freq": save_freq,
+                    "project_name": project,
+                    "experiment_name": experiment,
+                },
+                "rollout": {
+                    "n": group_size,
+                },
+                "workflow": {
+                    "use_workflow": True,
+                    "workflow_args": {
+                        # Default rollout timeout; a --config-declared value wins.
+                        "timeout": user_workflow_timeout if user_workflow_timeout is not None else 300,
+                    },
+                },
+            },
+        }
+    )
+    merged = OmegaConf.merge(merged, overrides)
+
+    # total_steps overrides epochs
+    if total_steps is not None:
+        merged = OmegaConf.merge(
+            merged,
+            OmegaConf.create(
+                {
+                    "rllm": {"trainer": {"total_batches": total_steps, "total_epochs": 1}},
+                }
+            ),
+        )
+
+    # Output directory
+    if output_dir is not None:
+        merged = OmegaConf.merge(
+            merged,
+            OmegaConf.create(
+                {
+                    "training": {"default_local_dir": output_dir},
+                }
+            ),
+        )
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# 2. _run_train  — core training logic
+# ---------------------------------------------------------------------------
+
+
+def _run_train(
+    benchmark: str,
+    agent_name: str | None,
+    evaluator_name: str | None,
+    model: str,
+    train_dataset_name: str | None,
+    train_split: str | None,
+    val_dataset_name: str | None,
+    val_split: str | None,
+    max_examples: int | None,
+    group_size: int,
+    batch_size: int,
+    lr: float,
+    lora_rank: int,
+    total_epochs: int,
+    total_steps: int | None,
+    val_freq: int,
+    save_freq: int,
+    project: str,
+    experiment: str,
+    output_dir: str | None,
+    config_file: str | None,
+    enable_ui: bool = False,
+    sandbox_backend: str | None = None,
+    sandbox_concurrency: int | None = None,
+    sampling_params: str | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+    max_tokens: int | None = None,
+):
+    """Core training logic: resolve catalog, load data, build config, launch trainer."""
+
+    try:
+        from rllm.eval.agent_loader import load_agent
+        from rllm.eval.evaluator_loader import load_evaluator, resolve_evaluator_from_catalog
+        from rllm.trainer import AgentTrainer
+    except ImportError as e:
+        fail(f"Missing training dependencies: {e}\n  Install with: pip install 'rllm[train]'")
+
+    # ------------------------------------------------------------------
+    # Local benchmark path: directory with dataset.toml / task.toml
+    # ------------------------------------------------------------------
+    from rllm.tasks.loader import BenchmarkLoader
+
+    catalog = {}  # needed for Harbor config path later
+    catalog_entry = None
+    train_ds_name = train_dataset_name or benchmark
+    val_ds_name = val_dataset_name or benchmark
+
+    if BenchmarkLoader.is_local_benchmark(benchmark):
+        from rllm.data.dataset import Dataset as _Dataset
+
+        # --train/--val-dataset may each point at a separate local benchmark dir;
+        # an unset (or non-local) --val-dataset falls back to reusing the train tasks.
+        train_dir = train_dataset_name if (train_dataset_name and BenchmarkLoader.is_local_benchmark(train_dataset_name)) else benchmark
+        val_dir = val_dataset_name if (val_dataset_name and BenchmarkLoader.is_local_benchmark(val_dataset_name)) else None
+        if val_dataset_name and val_dir is None:
+            console.print(f"  [key]--val-dataset '{val_dataset_name}' is not a local benchmark dir; reusing train tasks for validation.[/]")
+
+        # For local sandbox tasks, --agent picks the AgentFlow.
+        bench_result = BenchmarkLoader.load(train_dir, sandbox_backend=sandbox_backend, harness_name=agent_name)
+        # dataset.toml's default_sandbox applies when --sandbox-backend wasn't
+        # given (same rule as the eval CLI).
+        if not sandbox_backend and bench_result.sandbox_backend:
+            sandbox_backend = bench_result.sandbox_backend
+        train_ds_name = bench_result.name
+        catalog_entry = {
+            "description": bench_result.description,
+            "category": bench_result.category,
+            "default_agent": bench_result.harness_name,
+        }
+        if agent_name is None:
+            agent_name = bench_result.harness_name or "react"
+
+        try:
+            agent_flow = load_agent(agent_name)
+        except (KeyError, ImportError, AttributeError, TypeError) as e:
+            fail(f"Cannot load agent '{agent_name}': {e}")
+
+        # Evaluator: --evaluator > train dataset.toml [verifier]; a host-side
+        # evaluator scores both train and val. Env-style verifiers
+        # (sandbox-shell / python-hybrid) resolve per task inside the sandbox
+        # via SandboxTaskHooks, so leave ``evaluator`` unset for those.
+        if evaluator_name is not None:
+            evaluator = load_evaluator(evaluator_name)
+            evaluator_display = evaluator_name
+        else:
+            from pathlib import Path as _Path
+
+            from rllm.eval._resolution import build_dataset_evaluator, dataset_verifier_kind
+
+            train_dir_path = _Path(train_dir).resolve()
+            evaluator = build_dataset_evaluator(train_dir_path)
+            if evaluator is not None:
+                evaluator_display = f"{type(evaluator).__name__} (from dataset.toml)"
+            else:
+                kind = dataset_verifier_kind(train_dir_path)
+                if kind == "missing":
+                    fail("Could not resolve a verifier for this benchmark. Declare a verifier in dataset.toml ([verifier].name / .module / .import_path / .script) or pass --evaluator explicitly.")
+                evaluator_display = f"per-task ({kind}, in-sandbox)"
+
+        if train_split is None:
+            train_split = bench_result.split or "train"
+        train_dataset = _Dataset(data=list(bench_result.tasks), name=bench_result.name, split=train_split)
+        if max_examples is not None and max_examples < len(train_dataset):
+            train_dataset = train_dataset.select(range(max_examples))
+
+        if val_dir is not None:
+            val_result = BenchmarkLoader.load(val_dir, harness_name=agent_name)
+            val_ds_name = val_result.name
+            if val_split is None:
+                val_split = val_result.split or "test"
+            val_dataset = _Dataset(data=list(val_result.tasks), name=val_result.name, split=val_split)
+        else:
+            val_ds_name = bench_result.name
+            if val_split is None:
+                val_split = bench_result.split or "test"
+            val_dataset = _Dataset(data=list(bench_result.tasks), name=bench_result.name, split=val_split)
+
+    # ------------------------------------------------------------------
+    # Catalog / Harbor path (existing behavior)
+    # ------------------------------------------------------------------
+    else:
+        # ---- Load catalog ----
+        catalog = load_dataset_catalog()
+        catalog_entry = catalog.get("datasets", {}).get(benchmark)
+
+        # ---- Explicit Harbor prefix: "harbor:<name>" ----
+        if catalog_entry is None and benchmark.startswith("harbor:"):
+            from rllm.cli._pull import resolve_harbor_catalog_entry
+
+            harbor_name = benchmark.removeprefix("harbor:")
+            catalog_entry = resolve_harbor_catalog_entry(harbor_name)
+            if catalog_entry:
+                console.print(f"  [success]Found Harbor dataset:[/] [val]{harbor_name}[/]")
+                benchmark = harbor_name
+
+        # ---- Docker check for Harbor datasets (local backends only) ----
+        from rllm.gateway.tunnel import is_local_sandbox_backend
+
+        if catalog_entry and catalog_entry.get("source", "").startswith("harbor:") and is_local_sandbox_backend(sandbox_backend):
+            from rllm.integrations.harbor.utils import diagnose_docker
+
+            ok, reason, hint = diagnose_docker()
+            if not ok:
+                message = f"Harbor tasks require Docker — {reason}."
+                if hint:
+                    message += f"\n  [dim]{hint}[/]"
+                fail(message)
+
+        # ---- Resolve agent ----
+        if agent_name is None:
+            if catalog_entry and "default_agent" in catalog_entry:
+                agent_name = catalog_entry["default_agent"]
+            else:
+                fail(f"No --agent specified and no default_agent in catalog for '{benchmark}'.")
+
+        try:
+            agent_flow = load_agent(agent_name)
+        except (KeyError, ImportError, AttributeError, TypeError) as e:
+            fail(f"Error loading agent '{agent_name}': {e}")
+
+        _is_harbor_source = bool(catalog_entry) and catalog_entry.get("source", "").startswith("harbor:")
+        _is_harbor_agent = bool(agent_name) and agent_name.startswith("harbor:")
+
+        # ---- Resolve evaluator ----
+        # Harbor datasets on an rllm-native harness skip ``harbor_reward_fn``
+        # and fall back to per-task verifier resolution via SandboxTaskHooks.
+        evaluator = None
+        evaluator_display = "per-task (from task.toml/dataset.toml)"
+        if evaluator_name is not None:
+            try:
+                evaluator = load_evaluator(evaluator_name)
+                evaluator_display = f"{evaluator_name} (overrides per-task verifier)"
+            except (KeyError, ImportError, AttributeError, TypeError) as e:
+                fail(f"Error loading evaluator '{evaluator_name}': {e}")
+        else:
+            _harbor_reward_fn_skipped = _is_harbor_source and catalog_entry.get("reward_fn") == "harbor_reward_fn" and not _is_harbor_agent
+            if _harbor_reward_fn_skipped:
+                evaluator_display = "per-task (rllm runtime on harbor task)"
+            else:
+                evaluator = resolve_evaluator_from_catalog(benchmark)
+                if evaluator is not None:
+                    reward_fn_name = catalog_entry.get("reward_fn", "") if catalog_entry else ""
+                    evaluator_display = reward_fn_name or type(evaluator).__name__
+                elif catalog_entry and catalog_entry.get("reward_fn"):
+                    try:
+                        evaluator = load_evaluator(catalog_entry["reward_fn"])
+                        evaluator_display = catalog_entry["reward_fn"]
+                    except (KeyError, ImportError):
+                        pass
+
+        if evaluator is None and not _is_harbor_source:
+            fail(f"No evaluator found for '{benchmark}'. Specify --evaluator explicitly.")
+
+        # ---- Resolve dataset names ----
+        train_ds_name = train_dataset_name or benchmark
+        val_ds_name = val_dataset_name or benchmark
+
+        # ---- Resolve catalog entries for train + val datasets ----
+        train_entry = _resolve_dataset_entry(train_ds_name, catalog, benchmark, catalog_entry)
+        val_entry = _resolve_dataset_entry(val_ds_name, catalog, benchmark, catalog_entry)
+
+        # ---- Resolve train/val splits ----
+        if train_split is None:
+            if train_entry and "train_split" in train_entry:
+                train_split = train_entry["train_split"]
+            elif train_entry and train_entry.get("source", "").startswith("harbor:"):
+                train_split = train_entry.get("eval_split", "default")
+            else:
+                train_split = "train"
+
+        if val_split is None:
+            val_split = val_entry.get("eval_split", "test") if val_entry else "test"
+
+        # ---- Load training dataset ----
+        train_dataset = _load_or_pull_dataset(train_ds_name, train_split, catalog, train_entry)
+        if train_dataset is None:
+            fail(f"Could not load training dataset '{train_ds_name}' split '{train_split}'.")
+
+        if max_examples is not None and max_examples < len(train_dataset):
+            train_dataset = train_dataset.select(range(max_examples))
+
+        # ---- Load validation dataset ----
+        val_dataset = _load_or_pull_dataset(val_ds_name, val_split, catalog, val_entry)
+        # val_dataset can be None — training will proceed without validation
+
+        # Wrap harbor rows as Tasks rooted at ``task_path`` for per-task
+        # verifier resolution.
+        from rllm.data.dataset import Dataset as _Dataset
+        from rllm.data.dataset import _wrap_rows_as_tasks
+
+        if train_entry and train_entry.get("source", "").startswith("harbor:"):
+            train_dataset = _Dataset(data=_wrap_rows_as_tasks(list(train_dataset.data)), name=train_ds_name, split=train_split)
+        if val_dataset is not None and val_entry and val_entry.get("source", "").startswith("harbor:"):
+            val_dataset = _Dataset(data=_wrap_rows_as_tasks(list(val_dataset.data)), name=val_ds_name, split=val_split)
+
+    # ---- Build config ----
+    config = build_train_config(
+        model_name=model,
+        group_size=group_size,
+        batch_size=batch_size,
+        lr=lr,
+        lora_rank=lora_rank,
+        total_epochs=total_epochs,
+        total_steps=total_steps,
+        val_freq=val_freq,
+        save_freq=save_freq,
+        project=project,
+        experiment=experiment,
+        output_dir=output_dir,
+        config_file=config_file,
+    )
+
+    # Layer --sampling-params over base.yaml rollout.{train,val}; gateway-enforced.
+    from omegaconf import OmegaConf
+
+    from rllm.cli._sampling import resolve_train_sampling
+
+    base_train = OmegaConf.to_container(config.rllm.rollout.train, resolve=True)
+    base_val = OmegaConf.to_container(config.rllm.rollout.val, resolve=True)
+    try:
+        train_sc, val_sc = resolve_train_sampling(sampling_params, temperature, top_p, max_tokens, base_train=base_train, base_val=base_val)
+    except (ValueError, FileNotFoundError, TypeError) as e:
+        fail(f"Invalid --sampling-params: {e}")
+    config.rllm.rollout.train = train_sc.as_dict()
+    config.rllm.rollout.val = val_sc.as_dict()
+
+    # ---- Wire UI logging ----
+    if enable_ui:
+        if not os.environ.get("RLLM_UI_URL"):
+            os.environ["RLLM_UI_URL"] = "https://ui.rllm-project.com"
+        from omegaconf import OmegaConf
+
+        loggers = list(config.rllm.trainer.logger)
+        if "ui" not in loggers:
+            loggers.append("ui")
+        config = OmegaConf.merge(
+            config,
+            OmegaConf.create(
+                {
+                    "rllm": {"trainer": {"logger": loggers}},
+                }
+            ),
+        )
+
+    # ---- Display header ----
+    val_info = f"[val]{val_ds_name}[/]  [dim]({val_split}, {len(val_dataset)} examples)[/]" if val_dataset else "[dim]None[/]"
+    rows = [
+        ("Benchmark", f"[val]{benchmark}[/]"),
+        ("Model", f"[val]{model}[/]"),
+        ("Agent", f"[val]{agent_name}[/]"),
+        ("Evaluator", f"[dim]{evaluator_display}[/]"),
+        ("Train data", f"[val]{train_ds_name}[/]  [dim]({train_split}, {len(train_dataset)} examples)[/]"),
+        ("Val data", val_info),
+    ]
+    tunnel_cfg = (config.rllm.get("gateway", {}) or {}).get("tunnel")
+    sandbox_row = _describe_sandbox_routing(agent_flow, train_dataset, val_dataset, sandbox_backend, sandbox_concurrency, tunnel_cfg)
+    if sandbox_row is not None:
+        rows.append(("Sandbox", sandbox_row))
+    train_sp = train_sc.as_dict()
+    val_sp = val_sc.as_dict()
+    if train_sp or val_sp:
+        sp_text = f"train={train_sp}" + (f"  val={val_sp}" if val_sp != train_sp else "")
+        rows.append(("Sampling", f"[dim]{sp_text} (gateway-enforced)[/]"))
+    rows.append(("Group size", f"[dim]{group_size}[/]"))
+    rows.append(("Batch size", f"[dim]{batch_size}[/]"))
+    rows.append(("Learning rate", f"[dim]{lr}[/]"))
+    rows.append(("LoRA rank", f"[dim]{lora_rank}[/]"))
+    epochs_str = f"[dim]{total_epochs}[/]"
+    if total_steps is not None:
+        epochs_str += f"  [dim](max {total_steps} steps)[/]"
+    rows.append(("Epochs", epochs_str))
+    if enable_ui:
+        rows.append(("Live UI", f"[val]{os.environ['RLLM_UI_URL']}[/]"))
+    console.print()
+    console.print(info_panel(rows, title="[bold]rLLM Train[/]", label_width=14))
+    console.print()
+
+    # ---- Launch training ----
+    trainer = AgentTrainer(
+        backend="tinker",
+        agent_flow=agent_flow,
+        evaluator=evaluator,
+        sandbox_backend=sandbox_backend,
+        sandbox_concurrency=sandbox_concurrency,
+        config=config,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+    )
+    trainer.train()
+
+
+def _describe_sandbox_routing(
+    agent_flow,
+    train_dataset,
+    val_dataset,
+    sandbox_backend: str | None,
+    sandbox_concurrency: int | None,
+    tunnel: str | None,
+) -> str | None:
+    """One-line description of sandbox + gateway routing for the header. Returns ``None`` when no sandbox is needed."""
+    from rllm.gateway.tunnel import is_local_sandbox_backend, parse_tunnel
+    from rllm.hooks import scan_env_requirements
+
+    if not scan_env_requirements(agent_flow, train_dataset, val_dataset, sandbox_backend=sandbox_backend).needs_env:
+        return None
+
+    backend = (sandbox_backend or "docker").lower()
+    if is_local_sandbox_backend(backend):
+        gateway_note = "loopback (host.docker.internal)"
+    else:
+        public_url, tunnel_backend = parse_tunnel(tunnel)
+        if public_url:
+            gateway_note = f"public_url={public_url}"
+        else:
+            gateway_note = f"{tunnel_backend or 'cloudflared'} tunnel (auto-spawn)"
+    concurrency_note = f", concurrency={sandbox_concurrency}" if sandbox_concurrency is not None else ""
+    return f"[val]{backend}[/]  [dim]· gateway: {gateway_note}{concurrency_note}[/]"
+
+
+def _resolve_dataset_entry(name: str, catalog: dict, benchmark: str | None = None, benchmark_entry: dict | None = None) -> dict | None:
+    """Resolve a dataset name to a catalog entry.
+
+    Order: ``catalog["datasets"][name]`` → ``benchmark_entry`` if
+    ``name == benchmark`` → Harbor registry probe.
+    """
+    entry = catalog.get("datasets", {}).get(name)
+    if entry is not None:
+        return entry
+    if benchmark is not None and name == benchmark and benchmark_entry is not None:
+        return benchmark_entry
+    try:
+        from rllm.cli._pull import resolve_harbor_catalog_entry
+
+        return resolve_harbor_catalog_entry(name)
+    except Exception:
+        return None
+
+
+def _load_or_pull_dataset(name: str, split: str, catalog: dict, catalog_entry_override: dict | None = None):
+    """Load a dataset, auto-pulling from HuggingFace/Harbor if not cached.
+
+    ``catalog_entry_override`` drives the pull for runtime-resolved harbor
+    entries that aren't in ``catalog["datasets"]``.
+    """
+    from rich.status import Status
+
+    from rllm.data import DatasetRegistry
+
+    dataset = DatasetRegistry.load_dataset(name, split)
+    if dataset is None:
+        catalog_entry = catalog_entry_override or catalog.get("datasets", {}).get(name)
+        if catalog_entry:
+            with Status(f"[dim]Pulling {name} from {catalog_entry['source']}...[/]", console=console):
+                pull_dataset(name, catalog_entry)
+            dataset = DatasetRegistry.load_dataset(name, split)
+    return dataset
+
+
+# ---------------------------------------------------------------------------
+# 3. train_cmd  — Click command
+# ---------------------------------------------------------------------------
+
+
+@click.command("train")
+@click.argument("benchmark")
+# Dataset options
+@click.option("--train-dataset", default=None, help="Training dataset name (default: same as <benchmark>).")
+@click.option("--train-split", default=None, help="Training split (default: catalog train_split, then 'train' if available, else eval_split).")
+@click.option("--val-dataset", default=None, help="Validation dataset name (default: same as <benchmark>).")
+@click.option("--val-split", default=None, help="Validation split (default: catalog eval_split).")
+@click.option("--max-examples", default=None, type=int, help="Limit training examples.")
+# Agent/evaluator options
+@click.option("--agent", "agent_name", default=None, help="Agent flow: registry name or module:object path.")
+@click.option("--evaluator", "evaluator_name", default=None, help="Evaluator: registry name or module:class path.")
+# Model/training options
+@click.option("--model", default="Qwen/Qwen3-8B", help="Model name/path (default: Qwen/Qwen3-8B).")
+@click.option("--group-size", default=8, type=int, help="Rollouts per prompt for GRPO (default: 8).")
+@click.option("--batch-size", default=32, type=int, help="Training batch size (default: 32).")
+@click.option("--lr", default=2e-5, type=float, help="Learning rate (default: 2e-5).")
+@click.option("--lora-rank", default=32, type=int, help="LoRA rank (default: 32).")
+@click.option("--epochs", "total_epochs", default=1, type=int, help="Total training epochs (default: 1).")
+@click.option("--max-steps", "total_steps", default=None, type=int, help="Stop after N steps (overrides --epochs).")
+@click.option("--val-freq", default=5, type=int, help="Validate every N steps (default: 5).")
+@click.option("--save-freq", default=20, type=int, help="Checkpoint every N steps (default: 20).")
+# Output/config options
+@click.option("--project", default="rllm-train", help="Project name for logging (default: rllm-train).")
+@click.option("--experiment", default=None, help="Experiment name (default: <benchmark>).")
+@click.option("--output", "output_dir", default=None, help="Checkpoint directory.")
+@click.option("--config", "config_file", default=None, type=click.Path(exists=True), help="YAML config file merged on top of base templates. CLI flags override it.")
+# UI logging options
+@click.option("--ui/--no-ui", "enable_ui", default=None, help="Enable/disable live UI logging. Default: auto-enabled when logged in (see 'rllm login').")
+# Sandbox options
+@click.option(
+    "--sandbox-backend",
+    "sandbox_backend",
+    default=None,
+    type=click.Choice(["docker", "local", "modal", "daytona", "e2b", "runloop", "gke", "apple-container"], case_sensitive=False),
+    help="Sandbox backend for SandboxedAgentFlow harnesses (default: per-task or docker). Remote backends auto-spawn a cloudflared tunnel for the gateway.",
+)
+@click.option("--sandbox-concurrency", "sandbox_concurrency", default=None, type=int, help="Override max concurrent sandboxes (default: agent's max_concurrent — usually 64).")
+# Sampling options (resolved into rollout.{train,val}; gateway-enforced)
+@click.option("--sampling-params", "sampling_params", default=None, help=_SAMPLING_PARAMS_HELP)
+@click.option("--temperature", default=None, type=float, help="Sampling temperature for train+val (shortcut for --sampling-params temperature=...).")
+@click.option("--top-p", "top_p", default=None, type=float, help="Nucleus sampling top_p for train+val (shortcut).")
+@click.option("--max-tokens", "max_tokens", default=None, type=int, help="Max generated tokens per call for train+val (shortcut).")
+def train_cmd(
+    benchmark: str,
+    train_dataset: str | None,
+    train_split: str | None,
+    val_dataset: str | None,
+    val_split: str | None,
+    max_examples: int | None,
+    agent_name: str | None,
+    evaluator_name: str | None,
+    model: str,
+    group_size: int,
+    batch_size: int,
+    lr: float,
+    lora_rank: int,
+    total_epochs: int,
+    total_steps: int | None,
+    val_freq: int,
+    save_freq: int,
+    project: str,
+    experiment: str | None,
+    output_dir: str | None,
+    config_file: str | None,
+    enable_ui: bool | None,
+    sandbox_backend: str | None,
+    sandbox_concurrency: int | None,
+    sampling_params: str | None,
+    temperature: float | None,
+    top_p: float | None,
+    max_tokens: int | None,
+):
+    """Train a model on a benchmark dataset using RL."""
+    # Auto-detect UI logging: enable if user is logged in (has ui_api_key or RLLM_API_KEY)
+    _ui_explicit = enable_ui is not None
+    if enable_ui is None:
+        from rllm.eval.config import load_ui_config
+
+        ui_config = load_ui_config()
+        enable_ui = bool(os.environ.get("RLLM_API_KEY") or ui_config.get("ui_api_key"))
+
+    if not enable_ui and not _ui_explicit:
+        console.print("  [blue]Tip: Try rllm UI for live monitoring! Run [bold]rllm login[/bold] to get started.[/]")
+
+    if experiment is None:
+        experiment = benchmark
+
+    _run_train(
+        benchmark=benchmark,
+        agent_name=agent_name,
+        evaluator_name=evaluator_name,
+        model=model,
+        train_dataset_name=train_dataset,
+        train_split=train_split,
+        val_dataset_name=val_dataset,
+        val_split=val_split,
+        max_examples=max_examples,
+        group_size=group_size,
+        batch_size=batch_size,
+        lr=lr,
+        lora_rank=lora_rank,
+        total_epochs=total_epochs,
+        total_steps=total_steps,
+        val_freq=val_freq,
+        save_freq=save_freq,
+        project=project,
+        experiment=experiment,
+        output_dir=output_dir,
+        config_file=config_file,
+        enable_ui=enable_ui,
+        sandbox_backend=sandbox_backend,
+        sandbox_concurrency=sandbox_concurrency,
+        sampling_params=sampling_params,
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )

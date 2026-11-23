@@ -1,3 +1,18 @@
+# LSD — Length-Scaling Distillation
+
+Code for **Mitigating the Length-Scaling Tax with Online Distillation**.
+
+The rLLM-based LSD implementation is in **[rllm/](rllm/README.md)**, including
+routing, distillation losses, EMA teacher updates, math and deep-research
+recipes, and the vendored training backend. Start with its
+[code map and environment notes](rllm/README.md) and
+[source provenance](rllm/SOURCE.md).
+
+The earlier VERL tree and its history remain below and at the repository root.
+For the rLLM implementation, use `rllm/vendor/verl` as documented above.
+
+---
+
 <div align="center">
  👋 Hi, everyone!
     verl is a RL training library initiated by <b>ByteDance Seed team</b> and maintained by the verl community.

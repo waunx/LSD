@@ -1,0 +1,436 @@
+"""Tests for rllm train CLI command."""
+
+import os
+from unittest.mock import MagicMock, patch
+
+import pytest
+from click.testing import CliRunner
+
+from rllm.cli.main import cli
+from rllm.eval.types import EvalOutput, Signal
+from rllm.types import AgentConfig, Episode, Step, Task, Trajectory
+
+
+@pytest.fixture
+def tmp_rllm_home(monkeypatch, tmp_path):
+    """Set up a temporary RLLM_HOME directory."""
+    rllm_home = str(tmp_path / ".rllm")
+    monkeypatch.setenv("RLLM_HOME", rllm_home)
+    from rllm.data.dataset import DatasetRegistry
+
+    monkeypatch.setattr(DatasetRegistry, "_RLLM_HOME", rllm_home)
+    monkeypatch.setattr(DatasetRegistry, "_REGISTRY_FILE", os.path.join(rllm_home, "datasets", "registry.json"))
+    monkeypatch.setattr(DatasetRegistry, "_DATASET_DIR", os.path.join(rllm_home, "datasets"))
+    legacy_dir = str(tmp_path / "legacy_registry")
+    monkeypatch.setattr(DatasetRegistry, "_LEGACY_REGISTRY_DIR", legacy_dir)
+    monkeypatch.setattr(DatasetRegistry, "_LEGACY_REGISTRY_FILE", os.path.join(legacy_dir, "dataset_registry.json"))
+    monkeypatch.setattr(DatasetRegistry, "_LEGACY_DATASET_DIR", os.path.join(legacy_dir, "datasets"))
+    return rllm_home
+
+
+@pytest.fixture
+def runner():
+    return CliRunner()
+
+
+@pytest.fixture
+def mock_train_dataset(tmp_rllm_home):
+    """Register a small test dataset with train and test splits."""
+    from rllm.data import DatasetRegistry
+
+    train_data = [
+        {"question": "What is 1+1?", "ground_truth": "2", "data_source": "test"},
+        {"question": "What is 2+2?", "ground_truth": "4", "data_source": "test"},
+        {"question": "What is 3+3?", "ground_truth": "6", "data_source": "test"},
+        {"question": "What is 4+4?", "ground_truth": "8", "data_source": "test"},
+    ]
+    test_data = [
+        {"question": "What is 5+5?", "ground_truth": "10", "data_source": "test"},
+        {"question": "What is 6+6?", "ground_truth": "12", "data_source": "test"},
+    ]
+    DatasetRegistry.register_dataset("test_math", train_data, split="train")
+    DatasetRegistry.register_dataset("test_math", test_data, split="test")
+    return train_data, test_data
+
+
+class _MockAgentFlow:
+    """Mock AgentFlow that returns a fixed Episode."""
+
+    def run(self, task: Task, config: AgentConfig) -> Episode:
+        data = task.metadata if isinstance(task, Task) else task
+        step = Step(input=data.get("question", ""), output="mock answer", done=True)
+        return Episode(task=data, trajectories=[Trajectory(name="mock", steps=[step])], artifacts={"answer": "mock answer"})
+
+
+class _MockEvaluator:
+    """Mock evaluator that always returns correct."""
+
+    def evaluate(self, task: dict, episode: Episode) -> EvalOutput:
+        return EvalOutput(reward=1.0, is_correct=True, signals=[Signal(name="accuracy", value=1.0)])
+
+
+class TestBuildTrainConfig:
+    """Tests for build_train_config()."""
+
+    def test_produces_valid_dictconfig(self):
+        """Config should be an OmegaConf DictConfig mapping every CLI arg to its key."""
+        from rllm.cli.train import build_train_config
+
+        cfg = build_train_config(
+            model_name="Qwen/Qwen3-8B",
+            group_size=4,
+            batch_size=16,
+            lr=1e-5,
+            lora_rank=16,
+            total_epochs=2,
+            total_steps=100,
+            val_freq=10,
+            save_freq=50,
+            project="test-project",
+            experiment="test-exp",
+            output_dir="/tmp/my-checkpoints",
+            config_file=None,
+        )
+
+        from omegaconf import DictConfig
+
+        assert isinstance(cfg, DictConfig)
+
+        # Check model config
+        assert cfg.model.name == "Qwen/Qwen3-8B"
+        assert cfg.model.lora_rank == 16
+
+        # Check model_name is set in rllm namespace (used by SdkWorkflowFactory proxy)
+        assert cfg.rllm.model_name == "Qwen/Qwen3-8B"
+
+        # Check training config
+        assert cfg.training.group_size == 4
+        assert cfg.training.learning_rate == 1e-5
+
+        # Check rllm trainer config
+        assert cfg.rllm.trainer.test_freq == 10
+        assert cfg.rllm.trainer.save_freq == 50
+        assert cfg.rllm.trainer.project_name == "test-project"
+        assert cfg.rllm.trainer.experiment_name == "test-exp"
+
+        # total_steps sets total_batches and forces epochs=1 (overriding total_epochs=2)
+        assert cfg.rllm.trainer.total_batches == 100
+        assert cfg.rllm.trainer.total_epochs == 1
+
+        # output_dir maps to training.default_local_dir
+        assert cfg.training.default_local_dir == "/tmp/my-checkpoints"
+
+        # Check data config exists
+        assert hasattr(cfg, "data")
+        assert cfg.data.train_batch_size == 16
+
+    def test_config_file_merge(self, tmp_path):
+        """--config file should be merged and overridable by CLI flags."""
+        from rllm.cli.train import build_train_config
+
+        config_file = tmp_path / "custom.yaml"
+        config_file.write_text("model:\n  name: custom-model\ntraining:\n  learning_rate: 1e-4\nrllm:\n  workflow:\n    workflow_args:\n      timeout: 1234\n")
+
+        cfg = build_train_config(
+            model_name="Qwen/Qwen3-8B",  # CLI override should win
+            group_size=8,
+            batch_size=32,
+            lr=2e-5,  # CLI override should win over config file's 1e-4
+            lora_rank=32,
+            total_epochs=1,
+            total_steps=None,
+            val_freq=5,
+            save_freq=20,
+            project="test",
+            experiment="test",
+            output_dir=None,
+            config_file=str(config_file),
+        )
+
+        # CLI flags should win over config file
+        assert cfg.model.name == "Qwen/Qwen3-8B"
+        assert cfg.training.learning_rate == 2e-5
+        # A config-declared workflow timeout must survive the CLI-overrides
+        # layer (which otherwise sets a default of 300).
+        assert cfg.rllm.workflow.workflow_args.timeout == 1234
+
+
+class TestTrainCommand:
+    """Tests for the train CLI command."""
+
+    def test_train_help(self, runner):
+        """rllm train --help should show all options."""
+        result = runner.invoke(cli, ["train", "--help"])
+        assert result.exit_code == 0
+        assert "Train a model" in result.output
+        assert "--model" in result.output
+        assert "--group-size" in result.output
+        assert "--batch-size" in result.output
+        assert "--lr" in result.output
+        assert "--lora-rank" in result.output
+        assert "--epochs" in result.output
+        assert "--max-steps" in result.output
+        assert "--val-freq" in result.output
+        assert "--save-freq" in result.output
+        assert "--train-dataset" in result.output
+        assert "--val-dataset" in result.output
+        assert "--agent" in result.output
+        assert "--evaluator" in result.output
+        assert "--config" in result.output
+        assert "--ui" in result.output
+
+    def test_train_listed_in_main_help(self, runner):
+        """rllm --help should list the train command."""
+        result = runner.invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "train" in result.output
+
+    def test_train_no_agent_no_catalog(self, runner, tmp_rllm_home, mock_train_dataset):
+        """Train without --agent and no catalog default should error."""
+        with patch("rllm.cli.train.load_dataset_catalog", return_value={"datasets": {}}):
+            result = runner.invoke(cli, ["train", "unknown_benchmark"])
+        assert result.exit_code != 0
+        assert "No --agent specified" in result.output
+
+    def test_train_agent_resolution_from_catalog(self, runner, tmp_rllm_home, mock_train_dataset):
+        """Train should resolve agent from catalog and pass correct kwargs to AgentTrainer."""
+        catalog = {"datasets": {"test_math": {"default_agent": "math", "reward_fn": "math_reward_fn", "eval_split": "test"}}}
+        mock_agent = _MockAgentFlow()
+        mock_evaluator = _MockEvaluator()
+        mock_trainer = MagicMock()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=mock_agent) as mock_load_agent,
+            patch("rllm.eval.evaluator_loader.resolve_evaluator_from_catalog", return_value=mock_evaluator),
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer) as mock_at_cls,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "train",
+                    "test_math",
+                    "--model",
+                    "test-model",
+                    "--group-size",
+                    "4",
+                    "--lr",
+                    "1e-4",
+                    "--max-examples",
+                    "2",
+                ],
+            )
+
+        assert result.exit_code == 0
+        mock_load_agent.assert_called_once_with("math")
+        mock_trainer.train.assert_called_once()
+
+        # AgentTrainer must receive the resolved pieces and CLI-mapped config.
+        call_kwargs = mock_at_cls.call_args.kwargs
+        assert call_kwargs["backend"] == "tinker"
+        assert call_kwargs["agent_flow"] is not None
+        assert call_kwargs["evaluator"] is not None
+        assert call_kwargs["val_dataset"] is not None
+        # --max-examples 2 limits the training data.
+        assert len(call_kwargs["train_dataset"]) == 2
+        assert call_kwargs["config"].model.name == "test-model"
+        assert call_kwargs["config"].training.group_size == 4
+        assert call_kwargs["config"].training.learning_rate == 1e-4
+        # Experiment name defaults to the benchmark name.
+        assert call_kwargs["config"].rllm.trainer.experiment_name == "test_math"
+
+    def test_train_explicit_agent_and_evaluator(self, runner, tmp_rllm_home, mock_train_dataset):
+        """Train with explicit --agent and --evaluator should use them."""
+        catalog = {"datasets": {"test_math": {"eval_split": "test"}}}
+        mock_agent = _MockAgentFlow()
+        mock_evaluator = _MockEvaluator()
+        mock_trainer = MagicMock()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=mock_agent) as mock_load_agent,
+            patch("rllm.eval.evaluator_loader.load_evaluator", return_value=mock_evaluator) as mock_load_eval,
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "train",
+                    "test_math",
+                    "--agent",
+                    "custom_agent",
+                    "--evaluator",
+                    "custom_evaluator",
+                    "--model",
+                    "test-model",
+                ],
+            )
+
+        assert result.exit_code == 0
+        mock_load_agent.assert_called_once_with("custom_agent")
+        mock_load_eval.assert_called_once_with("custom_evaluator")
+
+    def test_train_sampling_params_reach_rollout_config(self, runner, tmp_rllm_home, mock_train_dataset):
+        """--sampling-params (+ standalone flags) must land in rllm.rollout.{train,val},
+        including extra keys, before the trainer is constructed."""
+        catalog = {"datasets": {"test_math": {"eval_split": "test"}}}
+        mock_trainer = MagicMock()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=_MockAgentFlow()),
+            patch("rllm.eval.evaluator_loader.load_evaluator", return_value=_MockEvaluator()),
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer) as mock_cls,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "train",
+                    "test_math",
+                    "--agent",
+                    "a",
+                    "--evaluator",
+                    "e",
+                    "--model",
+                    "m",
+                    "--sampling-params",
+                    "temperature=0.3,presence_penalty=0.5",
+                    "--top-p",
+                    "0.9",
+                ],
+            )
+
+        assert result.exit_code == 0, result.output
+        cfg = mock_cls.call_args.kwargs["config"]
+        # Standalone flag, string param, and extra key all reach train + val.
+        assert cfg.rllm.rollout.train.temperature == 0.3
+        assert cfg.rllm.rollout.train.top_p == 0.9
+        assert cfg.rllm.rollout.train.presence_penalty == 0.5
+        assert cfg.rllm.rollout.val.temperature == 0.3
+        assert cfg.rllm.rollout.val.presence_penalty == 0.5
+        # Untouched base key preserved: max_tokens keeps its base.yaml
+        # interpolation (${rllm.data.max_response_length}) and resolves sanely.
+        assert cfg.rllm.rollout.train.max_tokens == cfg.rllm.data.max_response_length
+        assert cfg.rllm.rollout.train.max_tokens > 0
+        # top_k is no longer defaulted (opt-in).
+        assert "top_k" not in cfg.rllm.rollout.train
+
+    def test_train_separate_val_dataset(self, runner, tmp_rllm_home):
+        """Train with --val-dataset should use a different validation dataset."""
+        from rllm.data import DatasetRegistry
+
+        train_data = [{"question": "q1", "ground_truth": "a1", "data_source": "test"}]
+        val_data = [{"question": "q2", "ground_truth": "a2", "data_source": "test"}]
+        DatasetRegistry.register_dataset("train_bench", train_data, split="train")
+        DatasetRegistry.register_dataset("val_bench", val_data, split="test")
+
+        catalog = {
+            "datasets": {
+                "train_bench": {"default_agent": "math", "reward_fn": "math_reward_fn", "eval_split": "test"},
+                "val_bench": {"eval_split": "test"},
+            }
+        }
+        mock_agent = _MockAgentFlow()
+        mock_evaluator = _MockEvaluator()
+        mock_trainer = MagicMock()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=mock_agent),
+            patch("rllm.eval.evaluator_loader.resolve_evaluator_from_catalog", return_value=mock_evaluator),
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer) as mock_at_cls,
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "train",
+                    "train_bench",
+                    "--val-dataset",
+                    "val_bench",
+                    "--model",
+                    "test-model",
+                ],
+            )
+
+        assert result.exit_code == 0
+        # The separate val dataset must reach the trainer as a distinct set.
+        kwargs = mock_at_cls.call_args.kwargs
+        assert len(kwargs["train_dataset"]) == 1
+        assert kwargs["val_dataset"] is not None
+        assert len(kwargs["val_dataset"]) == 1
+        assert kwargs["train_dataset"] is not kwargs["val_dataset"]
+
+    def test_train_local_separate_val_dataset(self, runner, tmp_rllm_home, tmp_path):
+        """Local benchmark dirs: --val-dataset pointing at a separate local dir yields a distinct val set."""
+
+        def _make_bench(root, name, n_tasks, split):
+            root.mkdir()
+            (root / "dataset.toml").write_text(f'[dataset]\nname = "{name}"\ntype = "sandbox"\nsplit = "{split}"\n')
+            for i in range(n_tasks):
+                td = root / f"task_{i}"
+                td.mkdir()
+                (td / "task.toml").write_text(f'[task]\nname = "{name}_{i}"\n')
+                (td / "instruction.md").write_text(f"do {i}")
+
+        train_dir = tmp_path / "train_bench"
+        val_dir = tmp_path / "val_bench"
+        _make_bench(train_dir, "train_bench", 2, "train")
+        _make_bench(val_dir, "val_bench", 1, "test")
+
+        mock_trainer = MagicMock()
+        with (
+            patch("rllm.eval.agent_loader.load_agent", return_value=_MockAgentFlow()),
+            patch("rllm.eval._resolution.build_dataset_evaluator", return_value=_MockEvaluator()),
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer) as mock_at_cls,
+        ):
+            result = runner.invoke(
+                cli,
+                ["train", str(train_dir), "--val-dataset", str(val_dir), "--agent", "react", "--model", "test-model"],
+            )
+
+        assert result.exit_code == 0, result.output
+        kwargs = mock_at_cls.call_args.kwargs
+        assert len(kwargs["train_dataset"]) == 2
+        assert len(kwargs["val_dataset"]) == 1
+        assert kwargs["train_dataset"] is not kwargs["val_dataset"]
+
+    def test_train_no_evaluator_found(self, runner, tmp_rllm_home, mock_train_dataset):
+        """Train should fail if no evaluator can be resolved."""
+        catalog = {"datasets": {"test_math": {"default_agent": "math"}}}
+        mock_agent = _MockAgentFlow()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=mock_agent),
+            patch("rllm.eval.evaluator_loader.resolve_evaluator_from_catalog", return_value=None),
+        ):
+            result = runner.invoke(cli, ["train", "test_math", "--model", "test-model"])
+
+        assert result.exit_code != 0
+        assert "No evaluator found" in result.output
+
+    @pytest.mark.parametrize("ui_flag", [False, True], ids=["default_no_ui", "ui_flag_appends_ui"])
+    def test_train_ui_logger(self, runner, tmp_rllm_home, mock_train_dataset, monkeypatch, ui_flag):
+        """'ui' joins the logger list only when --ui is passed (with RLLM_API_KEY set)."""
+        if ui_flag:
+            monkeypatch.setenv("RLLM_API_KEY", "test-key")
+        else:
+            monkeypatch.delenv("RLLM_API_KEY", raising=False)
+        catalog = {"datasets": {"test_math": {"default_agent": "math", "reward_fn": "math_reward_fn", "eval_split": "test"}}}
+        mock_agent = _MockAgentFlow()
+        mock_evaluator = _MockEvaluator()
+        mock_trainer = MagicMock()
+
+        with (
+            patch("rllm.cli.train.load_dataset_catalog", return_value=catalog),
+            patch("rllm.eval.agent_loader.load_agent", return_value=mock_agent),
+            patch("rllm.eval.evaluator_loader.resolve_evaluator_from_catalog", return_value=mock_evaluator),
+            patch("rllm.trainer.AgentTrainer", return_value=mock_trainer) as mock_at_cls,
+        ):
+            args = ["train", "test_math", "--model", "test-model"] + (["--ui"] if ui_flag else [])
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == 0
+        call_kwargs = mock_at_cls.call_args[1]
+        loggers = list(call_kwargs["config"].rllm.trainer.logger)
+        assert ("ui" in loggers) == ui_flag
